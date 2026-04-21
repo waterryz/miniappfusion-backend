@@ -253,3 +253,7 @@ async def start_server():
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
     print(f"API server running on port {port}")
+    await asyncio.Event().wait()
+
+if __name__ == "__main__":
+    asyncio.run(start_server())
