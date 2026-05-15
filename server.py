@@ -267,7 +267,9 @@ async def handle_fleet(request: web.Request):
             print(f"Fleet response: {str(data)[:200]}")
             if "d" not in data:
                 return web.json_response({"error": "No data"}, status=503)
-            retur
+            return web.json_response(data)
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=500)
 # ================== CORS MIDDLEWARE ==================
 @web.middleware
 async def cors_middleware(request, handler):
