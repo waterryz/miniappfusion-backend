@@ -24,7 +24,6 @@ cloudinary.config(
 
 # ================== AUTH ==================
 def verify_telegram_init_data(init_data: str) -> dict | None:
-    """Verify Telegram Web App initData signature and return user dict or None."""
     try:
         parsed = dict(urllib.parse.parse_qsl(init_data, strict_parsing=True))
         received_hash = parsed.pop("hash", None)
@@ -46,7 +45,6 @@ def verify_telegram_init_data(init_data: str) -> dict | None:
         if not hmac.compare_digest(expected_hash, received_hash):
             return None
 
-        # Check expiry (24h)
         auth_date = int(parsed.get("auth_date", 0))
         if time.time() - auth_date > 86400:
             return None
@@ -62,13 +60,9 @@ def get_user_from_request(request: web.Request) -> dict | None:
         return None
     return verify_telegram_init_data(init_data)
 
-def require_admin(handler):
-    async def wrapper(request):
-        user = get_user_from_request(request)
-        if not user or user.get("id") not in ALLOWED_ADMINS:
-            return web.json_response({"error": "Forbidden"}, status=403)
-        return await handler(request)
-    return wrapper
+def is_admin_request(request: web.Request) -> bool:
+    user = get_user_from_request(request)
+    return bool(user and user.get("id") in ALLOWED_ADMINS)
 
 # ================== HELPERS ==================
 def load_drivers() -> dict:
@@ -76,6 +70,11 @@ def load_drivers() -> dict:
         return {}
     with open(DATA_PATH, "r") as f:
         return json.load(f)
+
+def save_drivers(data: dict):
+    os.makedirs(os.path.dirname(DATA_PATH), exist_ok=True)
+    with open(DATA_PATH, "w") as f:
+        json.dump(data, f, indent=4, ensure_ascii=False)
 
 def get_driver_folder(driver_id: str, driver_name: str) -> str:
     name = driver_name.replace(" ", "_")
@@ -104,15 +103,24 @@ def list_driver_files(folder: str) -> list[dict]:
 
 # ================== ROUTES ==================
 
+async def handle_me(request: web.Request):
+    init_data = request.headers.get("X-Telegram-Init-Data", "")
+    user = verify_telegram_init_data(init_data) if init_data else None
+    if not user:
+        return web.json_response({"error": "Unauthorized"}, status=401)
+    return web.json_response({
+        "id": user.get("id"),
+        "name": user.get("first_name", ""),
+        "is_admin": user.get("id") in ALLOWED_ADMINS,
+    })
+
+
 async def handle_drivers(request: web.Request):
-    """GET /drivers — list all drivers with file counts."""
-    user = get_user_from_request(request)
-    if not user or user.get("id") not in ALLOWED_ADMINS:
+    if not is_admin_request(request):
         return web.json_response({"error": "Forbidden"}, status=403)
 
     drivers = load_drivers()
     result = []
-
     for uid, d in drivers.items():
         folder = get_driver_folder(uid, d["name"])
         files = list_driver_files(folder)
@@ -124,19 +132,16 @@ async def handle_drivers(request: web.Request):
             "tariff": d.get("tariff", ""),
             "file_count": len(files),
         })
-
     return web.json_response(result)
 
 
-async def handle_driver_files(request: web.Request):
-    """GET /driver/{id}/files — list files for a specific driver."""
-    user = get_user_from_request(request)
-    if not user or user.get("id") not in ALLOWED_ADMINS:
+async def handle_driver_get(request: web.Request):
+    """GET /driver/{id} — driver info + file list."""
+    if not is_admin_request(request):
         return web.json_response({"error": "Forbidden"}, status=403)
 
     driver_id = request.match_info["id"]
     drivers = load_drivers()
-
     if driver_id not in drivers:
         return web.json_response({"error": "Driver not found"}, status=404)
 
@@ -156,15 +161,80 @@ async def handle_driver_files(request: web.Request):
     })
 
 
-async def handle_upload(request: web.Request):
-    """POST /driver/{id}/upload — upload a file to driver's folder."""
-    user = get_user_from_request(request)
-    if not user or user.get("id") not in ALLOWED_ADMINS:
+async def handle_driver_add(request: web.Request):
+    """POST /drivers — add a new driver."""
+    if not is_admin_request(request):
+        return web.json_response({"error": "Forbidden"}, status=403)
+
+    try:
+        body = await request.json()
+        driver_id = str(body.get("id", "")).strip()
+        name = body.get("name", "").strip()
+        car_model = body.get("car_model", "").strip()
+        car_number = body.get("car_number", "").strip()
+        tariff = body.get("tariff", "").strip()
+
+        if not all([driver_id, name, car_model, car_number, tariff]):
+            return web.json_response({"error": "All fields required"}, status=400)
+
+        if not driver_id.isdigit():
+            return web.json_response({"error": "ID must be numeric"}, status=400)
+
+        drivers = load_drivers()
+        if driver_id in drivers:
+            return web.json_response({"error": "Driver with this ID already exists"}, status=409)
+
+        drivers[driver_id] = {
+            "name": name,
+            "car_model": car_model,
+            "car_number": car_number,
+            "tariff": tariff,
+        }
+        save_drivers(drivers)
+
+        return web.json_response({"success": True, "id": driver_id})
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=500)
+
+
+async def handle_driver_delete(request: web.Request):
+    """DELETE /driver/{id} — delete driver + all their files from Cloudinary."""
+    if not is_admin_request(request):
         return web.json_response({"error": "Forbidden"}, status=403)
 
     driver_id = request.match_info["id"]
     drivers = load_drivers()
+    if driver_id not in drivers:
+        return web.json_response({"error": "Driver not found"}, status=404)
 
+    driver = drivers[driver_id]
+    folder = get_driver_folder(driver_id, driver["name"])
+
+    # Delete all files from Cloudinary
+    try:
+        cloudinary.api.delete_resources_by_prefix(folder + "/")
+        # Delete the (now empty) folder too
+        try:
+            cloudinary.api.delete_folder(folder)
+        except Exception:
+            pass  # folder may not exist or already gone
+    except Exception as e:
+        print(f"Warn: couldn't delete Cloudinary resources: {e}")
+
+    # Remove from JSON
+    del drivers[driver_id]
+    save_drivers(drivers)
+
+    return web.json_response({"success": True})
+
+
+async def handle_upload(request: web.Request):
+    """POST /driver/{id}/upload — upload a file to driver's folder."""
+    if not is_admin_request(request):
+        return web.json_response({"error": "Forbidden"}, status=403)
+
+    driver_id = request.match_info["id"]
+    drivers = load_drivers()
     if driver_id not in drivers:
         return web.json_response({"error": "Driver not found"}, status=404)
 
@@ -173,18 +243,16 @@ async def handle_upload(request: web.Request):
 
     try:
         body = await request.json()
-        image_b64 = body.get("image")  # base64 string
+        image_b64 = body.get("image")
         doc_name = body.get("name", "document").strip().replace(" ", "_")
 
         if not image_b64:
             return web.json_response({"error": "No image provided"}, status=400)
 
-        # Strip data URI prefix if present
         if "," in image_b64:
             image_b64 = image_b64.split(",", 1)[1]
 
         image_bytes = base64.b64decode(image_b64)
-
         timestamp = int(time.time())
         filename = f"{doc_name}_{timestamp}"
 
@@ -201,24 +269,25 @@ async def handle_upload(request: web.Request):
             "url": result["secure_url"],
             "public_id": result["public_id"],
         })
-
     except Exception as e:
         return web.json_response({"error": str(e)}, status=500)
 
 
-async def handle_me(request: web.Request):
-    """GET /me — returns current user info (used by frontend to check admin status)."""
-    init_data = request.headers.get("X-Telegram-Init-Data", "")
-    user = verify_telegram_init_data(init_data) if init_data else None
+async def handle_file_delete(request: web.Request):
+    """DELETE /file — delete single file by public_id."""
+    if not is_admin_request(request):
+        return web.json_response({"error": "Forbidden"}, status=403)
 
-    if not user:
-        return web.json_response({"error": "Unauthorized"}, status=401)
+    try:
+        body = await request.json()
+        public_id = body.get("public_id", "").strip()
+        if not public_id:
+            return web.json_response({"error": "public_id required"}, status=400)
 
-    return web.json_response({
-        "id": user.get("id"),
-        "name": user.get("first_name", ""),
-        "is_admin": user.get("id") in ALLOWED_ADMINS,
-    })
+        cloudinary.uploader.destroy(public_id, resource_type="image")
+        return web.json_response({"success": True})
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=500)
 
 
 # ================== CORS MIDDLEWARE ==================
@@ -231,17 +300,28 @@ async def cors_middleware(request, handler):
 
     response.headers["Access-Control-Allow-Origin"] = "*"
     response.headers["Access-Control-Allow-Headers"] = "Content-Type, X-Telegram-Init-Data"
-    response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, DELETE, OPTIONS"
     return response
 
 
-# ================== APP ==================
 def create_app() -> web.Application:
     app = web.Application(middlewares=[cors_middleware])
     app.router.add_get("/me", handle_me)
+
+    # Drivers
     app.router.add_get("/drivers", handle_drivers)
-    app.router.add_get("/driver/{id}/files", handle_driver_files)
+    app.router.add_post("/drivers", handle_driver_add)
+    app.router.add_get("/driver/{id}", handle_driver_get)
+    app.router.add_delete("/driver/{id}", handle_driver_delete)
+
+    # Files
     app.router.add_post("/driver/{id}/upload", handle_upload)
+    app.router.add_delete("/file", handle_file_delete)
+
+    # OPTIONS preflight
+    for path in ["/me", "/drivers", "/driver/{id}", "/driver/{id}/upload", "/file"]:
+        app.router.add_options(path, lambda r: web.Response())
+
     return app
 
 
