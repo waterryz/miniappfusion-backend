@@ -95,7 +95,7 @@ async def planet_gps_login() -> bool:
         }
         
         # GET login page
-        login_url = "https://web.planetgps.com/Login.aspx"
+        login_url = "https://web.planetgps.com/index.aspx"
         async with _gps_session.get(login_url, headers=headers) as resp:
             html = await resp.text()
         
