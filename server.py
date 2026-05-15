@@ -228,34 +228,73 @@ async def handle_file_delete(request: web.Request):
 
 
 # ================== FLEET ==================
+from playwright.async_api import async_playwright
+
 PLANET_GPS_EMAIL = os.getenv("PLANET_GPS_EMAIL", "alexyss.waterry@icloud.com")
+PLANET_GPS_PASSWORD = os.getenv("PLANET_GPS_PASSWORD", "")
 PLANET_GPS_USER_ID = "272967"
+
 _gps_session = None
+_gps_cookies = None
+_playwright = None
+_browser = None
+
+async def planet_gps_login_playwright() -> bool:
+    global _playwright, _browser, _gps_cookies, _gps_session
+    try:
+        print("Starting Playwright login...")
+        _playwright = await async_playwright().start()
+        _browser = await _playwright.chromium.launch(headless=True)
+        context = await _browser.new_context()
+        page = await context.new_page()
+
+        await page.goto("https://web.planetgps.com/index.aspx", wait_until="networkidle")
+        await page.click("text=Login by Username")
+        await page.fill('input[name="txtUserName"]', PLANET_GPS_EMAIL)
+        await page.fill('input[name="txtAccountPassword"]', PLANET_GPS_PASSWORD)
+
+        async with page.expect_navigation(wait_until="networkidle"):
+            await page.click('input[name="btnLogin"]')
+
+        final_url = page.url
+        print(f"Playwright final URL: {final_url}")
+
+        cookies = await context.cookies()
+        _gps_cookies = {c["name"]: c["value"] for c in cookies}
+        print(f"Got cookies: {list(_gps_cookies.keys())}")
+
+        await context.close()
+        return "Monitor.aspx" in final_url or "p=" in final_url
+
+    except Exception as e:
+        print(f"Playwright login error: {e}")
+        return False
+
 
 async def handle_fleet(request: web.Request):
     if not is_admin_request(request):
         return web.json_response({"error": "Forbidden"}, status=403)
 
-    global _gps_session
+    global _gps_session, _gps_cookies
+    if not _gps_cookies:
+        ok = await planet_gps_login_playwright()
+        if not ok:
+            return web.json_response({"error": "PlanetGPS login failed"}, status=502)
+
     if not _gps_session:
+        from aiohttp import ClientSession, CookieJar
         from yarl import URL
         jar = CookieJar(unsafe=True)
         _gps_session = ClientSession(cookie_jar=jar)
-        jar.update_cookies({
-            "ASP.NET_SessionId": os.getenv("GPS_SESSION_ID", ""),
-            "HMACCOUNT": os.getenv("GPS_HMACCOUNT", ""),
-            "Language": "lan=en-us",
-            "Hm_lvt_47a62b648199a5f6d1bcbb82b31e9491": "1777895456",
-            "Hm_lpvt_47a62b648199a5f6d1bcbb82b31e9491": "1778859161",
-        }, response_url=URL("https://web.planetgps.com"))
+        jar.update_cookies(_gps_cookies, response_url=URL("https://web.planetgps.com"))
 
     payload = '{"UserID":272967,"isFirst":true,"TimeZones":"5:00","DeviceID":0}'
     headers = {
         "Content-Type": "application/json",
         "Accept": "application/json, text/javascript, */*; q=0.01",
-        "Referer": "https://web.planetgps.com/map.aspx?id=272967&n=alexyss.waterry%40icloud.com&p=1MM40YM033fe73f05",
+        "Referer": "https://web.planetgps.com/Monitor.aspx",
         "Origin": "https://web.planetgps.com",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
         "X-Requested-With": "XMLHttpRequest",
     }
     try:
@@ -264,11 +303,15 @@ async def handle_fleet(request: web.Request):
             data=payload, headers=headers
         ) as resp:
             data = await resp.json(content_type=None)
-            print(f"Fleet response: {str(data)[:500]}")
-            if "d" not in data:
-                return web.json_response({"error": "No data"}, status=503)
+            print(f"Fleet response: {str(data)[:200]}")
+            if "d" not in data or not data["d"]:
+                _gps_cookies = None
+                _gps_session = None
+                return web.json_response({"error": "Session expired"}, status=503)
             return web.json_response(data)
     except Exception as e:
+        _gps_cookies = None
+        _gps_session = None
         return web.json_response({"error": str(e)}, status=500)
 # ================== CORS MIDDLEWARE ==================
 @web.middleware
