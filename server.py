@@ -74,7 +74,6 @@ def require_admin(handler):
 import re
 from aiohttp import ClientSession, CookieJar
 
-
 PLANET_GPS_EMAIL = os.getenv("PLANET_GPS_EMAIL")
 PLANET_GPS_PASSWORD = os.getenv("PLANET_GPS_PASSWORD")
 PLANET_GPS_USER_ID = "272967"
@@ -141,12 +140,16 @@ async def planet_gps_login() -> bool:
 
 async def handle_fleet(request: web.Request):
     user = get_user_from_request(request)
+    print(f"Fleet request, user: {user}, headers: {dict(request.headers)}")
     if not user or user.get("id") not in ALLOWED_ADMINS:
         return web.json_response({"error": "Forbidden"}, status=403)
 
-    global _gps_session
-    if not _gps_session:
-        _gps_session = ClientSession(cookie_jar=CookieJar(unsafe=True))
+    global _gps_session, _gps_token
+
+    if not _gps_token:
+        ok = await planet_gps_login()
+        if not ok:
+            return web.json_response({"error": "PlanetGPS login failed"}, status=502)
 
     payload = {
         "UserID": int(PLANET_GPS_USER_ID),
@@ -156,21 +159,23 @@ async def handle_fleet(request: web.Request):
     }
     headers = {
         "Content-Type": "application/json",
-        "Referer": f"https://web.planetgps.com/IframeMap.aspx?id={PLANET_GPS_USER_ID}&n={PLANET_GPS_EMAIL}&m=Gaode2&p=PSX40FI533fe73f05",
+        "Referer": f"https://web.planetgps.com/IframeMap.aspx?id={PLANET_GPS_USER_ID}&n={PLANET_GPS_EMAIL}&m=Gaode2&p={_gps_token}",
         "Origin": "https://web.planetgps.com",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
     }
+
     try:
         async with _gps_session.post(
             "https://web.planetgps.com/Ajax/DevicesAjax.asmx/GetDevicesByUserID",
             json=payload, headers=headers
         ) as resp:
             data = await resp.json(content_type=None)
-            print(f"Fleet response: {str(data)[:200]}")
+            # Token expired — re-login next time
             if "d" not in data:
-                return web.json_response({"error": "No data"}, status=503)
+                _gps_token = None
+                return web.json_response({"error": "Session expired"}, status=503)
             return web.json_response(data)
     except Exception as e:
+        _gps_token = None
         return web.json_response({"error": str(e)}, status=500)
 
 # ================== HELPERS ==================
@@ -343,14 +348,11 @@ def create_app() -> web.Application:
     app = web.Application(middlewares=[cors_middleware])
     app.router.add_get("/me", handle_me)
     app.router.add_get("/drivers", handle_drivers)
-    app.router.add_post("/drivers", handle_add_driver)      # ← добавить
-    app.router.add_get("/driver/{id}", handle_driver)        # ← добавить
     app.router.add_get("/driver/{id}/files", handle_driver_files)
     app.router.add_post("/driver/{id}/upload", handle_upload)
-    app.router.add_delete("/driver/{id}", handle_delete_driver)  # ← добавить
-    app.router.add_delete("/file", handle_delete_file)           # ← добавить
     app.router.add_get("/api/fleet", handle_fleet)
     return app
+
 
 async def start_server():
     app = create_app()
