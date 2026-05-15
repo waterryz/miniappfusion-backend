@@ -10,6 +10,7 @@ import cloudinary
 import cloudinary.uploader
 import cloudinary.api
 import base64
+from yarl import URL
 
 # ================== CONFIG ==================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -237,7 +238,14 @@ async def handle_fleet(request: web.Request):
 
     global _gps_session
     if not _gps_session:
-        _gps_session = ClientSession(cookie_jar=CookieJar(unsafe=True))
+        jar = CookieJar(unsafe=True)
+        _gps_session = ClientSession(cookie_jar=jar)
+        # Set cookies from env
+        _gps_session.cookie_jar.update_cookies({
+            "ASP.NET_SessionId": os.getenv("GPS_SESSION_ID", ""),
+            "HMACCOUNT": os.getenv("GPS_HMACCOUNT", ""),
+            "HSID": os.getenv("GPS_HSID", ""),
+        }, response_url=URL("https://web.planetgps.com"))
 
     payload = {
         "UserID": int(PLANET_GPS_USER_ID),
@@ -247,7 +255,7 @@ async def handle_fleet(request: web.Request):
     }
     headers = {
         "Content-Type": "application/json",
-        "Referer": f"https://web.planetgps.com/IframeMap.aspx?id={PLANET_GPS_USER_ID}&n={PLANET_GPS_EMAIL}&m=Gaode2&p=PSX40FI533fe73f05",
+        "Referer": "https://web.planetgps.com/Monitor.aspx",
         "Origin": "https://web.planetgps.com",
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
     }
@@ -263,7 +271,6 @@ async def handle_fleet(request: web.Request):
             return web.json_response(data)
     except Exception as e:
         return web.json_response({"error": str(e)}, status=500)
-
 
 # ================== CORS MIDDLEWARE ==================
 @web.middleware
