@@ -115,8 +115,9 @@ async def planet_gps_login() -> bool:
 
         data = {
             **fields,
+            "LType": "1",
             "txtUserName": PLANET_GPS_EMAIL,
-            "txtPassword": PLANET_GPS_PASSWORD,
+            "txtAccountPassword": PLANET_GPS_PASSWORD,
             "btnLogin": "Log In",
         }
 
