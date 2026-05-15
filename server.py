@@ -249,7 +249,7 @@ async def handle_fleet(request: web.Request):
             "Hm_lpvt_47a62b648199a5f6d1bcbb82b31e9491": "1778859161",
         }, response_url=URL("https://web.planetgps.com"))
 
-    payload = '{"UserID":272967,"isFirst":false,"TimeZones":"5:00","DeviceID":0}'
+    payload = '{"UserID":272967,"isFirst":true,"TimeZones":"5:00","DeviceID":0}'
     headers = {
         "Content-Type": "application/json",
         "Accept": "application/json, text/javascript, */*; q=0.01",
