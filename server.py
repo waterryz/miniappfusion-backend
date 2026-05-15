@@ -363,6 +363,70 @@ async def handle_fleet_report(request: web.Request):
             return web.json_response(data)
     except Exception as e:
         return web.json_response({"error": str(e)}, status=500)
+
+
+async def handle_fleet_report_excel(request: web.Request):
+    if not is_admin_request(request):
+        return web.json_response({"error": "Forbidden"}, status=403)
+
+    params = request.rel_url.query
+    start = params.get("from", "")
+    end = params.get("to", "")
+    if not start or not end:
+        return web.json_response({"error": "Missing from/to"}, status=400)
+
+    global _gps_session, _gps_cookies
+    if not _gps_cookies:
+        ok = await planet_gps_login_playwright()
+        if not ok:
+            return web.json_response({"error": "Login failed"}, status=502)
+        from aiohttp import ClientSession, CookieJar
+        from yarl import URL
+        jar = CookieJar(unsafe=True)
+        _gps_session = ClientSession(cookie_jar=jar)
+        jar.update_cookies(_gps_cookies, response_url=URL("https://web.planetgps.com"))
+
+    # First get the report page to get VIEWSTATE
+    report_url = f"https://web.planetgps.com/Report/Report.aspx?id={PLANET_GPS_USER_ID}&deviceid=0&randon=12345"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Referer": report_url,
+    }
+    import re as _re
+    async with _gps_session.get(report_url, headers=headers) as resp:
+        html = await resp.text()
+
+    fields = {}
+    for field in ["__VIEWSTATE", "__VIEWSTATEGENERATOR", "__EVENTVALIDATION"]:
+        m = _re.search(rf'id="{field}"[^>]*value="([^"]*)"', html)
+        fields[field] = m.group(1) if m else ""
+
+    data = {
+        **fields,
+        "beginTime": start,
+        "endTime": end,
+        "btnToExcel": "To Excel",
+        "hidUserID": PLANET_GPS_USER_ID,
+        "hidTimeZone": "5:00",
+        "hidDeviceID": "0",
+    }
+
+    post_headers = {
+        **headers,
+        "Content-Type": "application/x-www-form-urlencoded",
+    }
+
+    try:
+        async with _gps_session.post(report_url, data=data, headers=post_headers) as resp:
+            content = await resp.read()
+            content_type = resp.headers.get("Content-Type", "application/octet-stream")
+            return web.Response(
+                body=content,
+                content_type="application/vnd.ms-excel",
+                headers={"Content-Disposition": f'attachment; filename="report_{start[:10]}_{end[:10]}.xls"'}
+            )
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=500)
 # ================== CORS MIDDLEWARE ==================
 @web.middleware
 async def cors_middleware(request, handler):
@@ -387,6 +451,7 @@ def create_app() -> web.Application:
     app.router.add_delete("/file", handle_file_delete)
     app.router.add_get("/api/fleet", handle_fleet)
     app.router.add_get("/api/fleet/report", handle_fleet_report)
+    app.router.add_get("/api/fleet/report/excel", handle_fleet_report_excel)
     for path in ["/me", "/drivers", "/driver/{id}", "/driver/{id}/upload", "/file", "/api/fleet"]:
         app.router.add_options(path, lambda r: web.Response())
     return app
