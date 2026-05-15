@@ -5,7 +5,7 @@ import json
 import os
 import time
 import urllib.parse
-from aiohttp import web
+from aiohttp import web, ClientSession, CookieJar
 import cloudinary
 import cloudinary.uploader
 import cloudinary.api
@@ -29,26 +29,14 @@ def verify_telegram_init_data(init_data: str) -> dict | None:
         received_hash = parsed.pop("hash", None)
         if not received_hash:
             return None
-
-        data_check_string = "\n".join(
-            f"{k}={v}" for k, v in sorted(parsed.items())
-        )
-
-        secret_key = hmac.new(
-            b"WebAppData", BOT_TOKEN.encode(), hashlib.sha256
-        ).digest()
-
-        expected_hash = hmac.new(
-            secret_key, data_check_string.encode(), hashlib.sha256
-        ).hexdigest()
-
+        data_check_string = "\n".join(f"{k}={v}" for k, v in sorted(parsed.items()))
+        secret_key = hmac.new(b"WebAppData", BOT_TOKEN.encode(), hashlib.sha256).digest()
+        expected_hash = hmac.new(secret_key, data_check_string.encode(), hashlib.sha256).hexdigest()
         if not hmac.compare_digest(expected_hash, received_hash):
             return None
-
         auth_date = int(parsed.get("auth_date", 0))
         if time.time() - auth_date > 86400:
             return None
-
         user = json.loads(parsed.get("user", "{}"))
         return user
     except Exception:
@@ -82,11 +70,7 @@ def get_driver_folder(driver_id: str, driver_name: str) -> str:
 
 def list_driver_files(folder: str) -> list[dict]:
     try:
-        result = cloudinary.api.resources(
-            type="upload",
-            prefix=folder + "/",
-            max_results=100
-        )
+        result = cloudinary.api.resources(type="upload", prefix=folder + "/", max_results=100)
         files = []
         for r in result.get("resources", []):
             files.append({
@@ -118,7 +102,6 @@ async def handle_me(request: web.Request):
 async def handle_drivers(request: web.Request):
     if not is_admin_request(request):
         return web.json_response({"error": "Forbidden"}, status=403)
-
     drivers = load_drivers()
     result = []
     for uid, d in drivers.items():
@@ -136,19 +119,15 @@ async def handle_drivers(request: web.Request):
 
 
 async def handle_driver_get(request: web.Request):
-    """GET /driver/{id} — driver info + file list."""
     if not is_admin_request(request):
         return web.json_response({"error": "Forbidden"}, status=403)
-
     driver_id = request.match_info["id"]
     drivers = load_drivers()
     if driver_id not in drivers:
         return web.json_response({"error": "Driver not found"}, status=404)
-
     driver = drivers[driver_id]
     folder = get_driver_folder(driver_id, driver["name"])
     files = list_driver_files(folder)
-
     return web.json_response({
         "driver": {
             "id": driver_id,
@@ -162,10 +141,8 @@ async def handle_driver_get(request: web.Request):
 
 
 async def handle_driver_add(request: web.Request):
-    """POST /drivers — add a new driver."""
     if not is_admin_request(request):
         return web.json_response({"error": "Forbidden"}, status=403)
-
     try:
         body = await request.json()
         driver_id = str(body.get("id", "")).strip()
@@ -173,119 +150,117 @@ async def handle_driver_add(request: web.Request):
         car_model = body.get("car_model", "").strip()
         car_number = body.get("car_number", "").strip()
         tariff = body.get("tariff", "").strip()
-
         if not all([driver_id, name, car_model, car_number, tariff]):
             return web.json_response({"error": "All fields required"}, status=400)
-
         if not driver_id.isdigit():
             return web.json_response({"error": "ID must be numeric"}, status=400)
-
         drivers = load_drivers()
         if driver_id in drivers:
             return web.json_response({"error": "Driver with this ID already exists"}, status=409)
-
-        drivers[driver_id] = {
-            "name": name,
-            "car_model": car_model,
-            "car_number": car_number,
-            "tariff": tariff,
-        }
+        drivers[driver_id] = {"name": name, "car_model": car_model, "car_number": car_number, "tariff": tariff}
         save_drivers(drivers)
-
         return web.json_response({"success": True, "id": driver_id})
     except Exception as e:
         return web.json_response({"error": str(e)}, status=500)
 
 
 async def handle_driver_delete(request: web.Request):
-    """DELETE /driver/{id} — delete driver + all their files from Cloudinary."""
     if not is_admin_request(request):
         return web.json_response({"error": "Forbidden"}, status=403)
-
     driver_id = request.match_info["id"]
     drivers = load_drivers()
     if driver_id not in drivers:
         return web.json_response({"error": "Driver not found"}, status=404)
-
     driver = drivers[driver_id]
     folder = get_driver_folder(driver_id, driver["name"])
-
-    # Delete all files from Cloudinary
     try:
         cloudinary.api.delete_resources_by_prefix(folder + "/")
-        # Delete the (now empty) folder too
         try:
             cloudinary.api.delete_folder(folder)
         except Exception:
-            pass  # folder may not exist or already gone
+            pass
     except Exception as e:
         print(f"Warn: couldn't delete Cloudinary resources: {e}")
-
-    # Remove from JSON
     del drivers[driver_id]
     save_drivers(drivers)
-
     return web.json_response({"success": True})
 
 
 async def handle_upload(request: web.Request):
-    """POST /driver/{id}/upload — upload a file to driver's folder."""
     if not is_admin_request(request):
         return web.json_response({"error": "Forbidden"}, status=403)
-
     driver_id = request.match_info["id"]
     drivers = load_drivers()
     if driver_id not in drivers:
         return web.json_response({"error": "Driver not found"}, status=404)
-
     driver = drivers[driver_id]
     folder = get_driver_folder(driver_id, driver["name"])
-
     try:
         body = await request.json()
         image_b64 = body.get("image")
         doc_name = body.get("name", "document").strip().replace(" ", "_")
-
         if not image_b64:
             return web.json_response({"error": "No image provided"}, status=400)
-
         if "," in image_b64:
             image_b64 = image_b64.split(",", 1)[1]
-
         image_bytes = base64.b64decode(image_b64)
         timestamp = int(time.time())
         filename = f"{doc_name}_{timestamp}"
-
-        result = cloudinary.uploader.upload(
-            image_bytes,
-            folder=folder,
-            public_id=filename,
-            resource_type="image"
-        )
-
-        return web.json_response({
-            "success": True,
-            "name": filename,
-            "url": result["secure_url"],
-            "public_id": result["public_id"],
-        })
+        result = cloudinary.uploader.upload(image_bytes, folder=folder, public_id=filename, resource_type="image")
+        return web.json_response({"success": True, "name": filename, "url": result["secure_url"], "public_id": result["public_id"]})
     except Exception as e:
         return web.json_response({"error": str(e)}, status=500)
 
 
 async def handle_file_delete(request: web.Request):
-    """DELETE /file — delete single file by public_id."""
     if not is_admin_request(request):
         return web.json_response({"error": "Forbidden"}, status=403)
-
     try:
         body = await request.json()
         public_id = body.get("public_id", "").strip()
         if not public_id:
             return web.json_response({"error": "public_id required"}, status=400)
-
         cloudinary.uploader.destroy(public_id, resource_type="image")
         return web.json_response({"success": True})
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=500)
+
+
+# ================== FLEET ==================
+PLANET_GPS_EMAIL = os.getenv("PLANET_GPS_EMAIL", "alexyss.waterry@icloud.com")
+PLANET_GPS_USER_ID = "272967"
+_gps_session = None
+
+async def handle_fleet(request: web.Request):
+    if not is_admin_request(request):
+        return web.json_response({"error": "Forbidden"}, status=403)
+
+    global _gps_session
+    if not _gps_session:
+        _gps_session = ClientSession(cookie_jar=CookieJar(unsafe=True))
+
+    payload = {
+        "UserID": int(PLANET_GPS_USER_ID),
+        "isFirst": True,
+        "TimeZones": "-4:00",
+        "DeviceId": 0
+    }
+    headers = {
+        "Content-Type": "application/json",
+        "Referer": f"https://web.planetgps.com/IframeMap.aspx?id={PLANET_GPS_USER_ID}&n={PLANET_GPS_EMAIL}&m=Gaode2&p=PSX40FI533fe73f05",
+        "Origin": "https://web.planetgps.com",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    }
+    try:
+        async with _gps_session.post(
+            "https://web.planetgps.com/Ajax/DevicesAjax.asmx/GetDevicesByUserID",
+            json=payload, headers=headers
+        ) as resp:
+            data = await resp.json(content_type=None)
+            print(f"Fleet response: {str(data)[:200]}")
+            if "d" not in data:
+                return web.json_response({"error": "No data"}, status=503)
+            return web.json_response(data)
     except Exception as e:
         return web.json_response({"error": str(e)}, status=500)
 
@@ -297,7 +272,6 @@ async def cors_middleware(request, handler):
         response = web.Response()
     else:
         response = await handler(request)
-
     response.headers["Access-Control-Allow-Origin"] = "*"
     response.headers["Access-Control-Allow-Headers"] = "Content-Type, X-Telegram-Init-Data"
     response.headers["Access-Control-Allow-Methods"] = "GET, POST, DELETE, OPTIONS"
@@ -307,21 +281,15 @@ async def cors_middleware(request, handler):
 def create_app() -> web.Application:
     app = web.Application(middlewares=[cors_middleware])
     app.router.add_get("/me", handle_me)
-
-    # Drivers
     app.router.add_get("/drivers", handle_drivers)
     app.router.add_post("/drivers", handle_driver_add)
     app.router.add_get("/driver/{id}", handle_driver_get)
     app.router.add_delete("/driver/{id}", handle_driver_delete)
-
-    # Files
     app.router.add_post("/driver/{id}/upload", handle_upload)
     app.router.add_delete("/file", handle_file_delete)
-
-    # OPTIONS preflight
-    for path in ["/me", "/drivers", "/driver/{id}", "/driver/{id}/upload", "/file"]:
+    app.router.add_get("/api/fleet", handle_fleet)
+    for path in ["/me", "/drivers", "/driver/{id}", "/driver/{id}/upload", "/file", "/api/fleet"]:
         app.router.add_options(path, lambda r: web.Response())
-
     return app
 
 
