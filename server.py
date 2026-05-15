@@ -341,6 +341,7 @@ def create_app() -> web.Application:
     app.router.add_get("/drivers", handle_drivers)
     app.router.add_get("/driver/{id}/files", handle_driver_files)
     app.router.add_post("/driver/{id}/upload", handle_upload)
+    app.router.add_get("/api/fleet", handle_fleet)
     return app
 
 
