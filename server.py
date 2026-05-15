@@ -264,7 +264,7 @@ async def handle_fleet(request: web.Request):
             data=payload, headers=headers
         ) as resp:
             data = await resp.json(content_type=None)
-            print(f"Fleet response: {str(data)[:200]}")
+            print(f"Fleet response: {str(data)[:500]}")
             if "d" not in data:
                 return web.json_response({"error": "No data"}, status=503)
             return web.json_response(data)
