@@ -83,52 +83,59 @@ _gps_token: str | None = None
 
 async def planet_gps_login() -> bool:
     global _gps_session, _gps_token
-    
     try:
         jar = CookieJar(unsafe=True)
         if _gps_session:
             await _gps_session.close()
         _gps_session = ClientSession(cookie_jar=jar)
-        
+
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
         }
-        
-        # GET login page
-        login_url = "https://web.planetgps.com/index.aspx"
+
+        # GET the iframe login page
+        login_url = "https://web.planetgps.com/loginpage/planetgps/login.aspx?language=en-us"
         async with _gps_session.get(login_url, headers=headers) as resp:
             html = await resp.text()
-        
-        # Extract ASP.NET hidden fields
+
+        print(f"Login iframe HTML: {html[:500]}")
+
+        # Extract fields
         fields = {}
         for field in ["__VIEWSTATE", "__VIEWSTATEGENERATOR", "__EVENTVALIDATION"]:
             m = re.search(rf'id="{field}"[^>]*value="([^"]*)"', html)
             fields[field] = m.group(1) if m else ""
-        
-        # POST login
+
+        print(f"Fields: {list(fields.keys())}, values len: {[len(v) for v in fields.values()]}")
+
+        # Find input names for username/password
+        import re as _re
+        inputs = _re.findall(r'<input[^>]+>', html)
+        print(f"All inputs: {inputs}")
+
         data = {
             **fields,
             "txtUserName": PLANET_GPS_EMAIL,
             "txtPassword": PLANET_GPS_PASSWORD,
-            "btnLogin": "Log+In",
+            "btnLogin": "Log In",
         }
-        
+
         async with _gps_session.post(
             login_url, data=data, headers=headers, allow_redirects=True
         ) as resp:
             final_url = str(resp.url)
+            body = await resp.text()
+            print(f"Post response URL: {final_url}")
+            print(f"Post response body: {body[:300]}")
             m = re.search(r'[?&]p=([^&]+)', final_url)
             if m:
                 _gps_token = m.group(1)
-                print(f"PlanetGPS login OK, token: {_gps_token}")
                 return True
-        
-        print(f"PlanetGPS login failed, final URL: {final_url}")
+
         return False
     except Exception as e:
         print(f"PlanetGPS login error: {e}")
         return False
-
 
 async def handle_fleet(request: web.Request):
     user = get_user_from_request(request)
