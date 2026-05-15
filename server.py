@@ -248,13 +248,18 @@ async def planet_gps_login_playwright() -> bool:
         context = await _browser.new_context()
         page = await context.new_page()
 
-        await page.goto("https://web.planetgps.com/index.aspx", wait_until="networkidle")
-        await page.click("text=Login by Username")
-        await page.fill('input[name="txtUserName"]', PLANET_GPS_EMAIL)
-        await page.fill('input[name="txtAccountPassword"]', PLANET_GPS_PASSWORD)
-
-        async with page.expect_navigation(wait_until="networkidle"):
-            await page.click('input[name="btnLogin"]')
+        await page.goto("https://web.planetgps.com/index.aspx", wait_until="domcontentloaded")
+        await page.wait_for_timeout(2000)
+        
+        # Login page is in an iframe
+        frame = page.frame_locator("iframe#ifm")
+        await frame.locator("#changBar0").click()  # Login by Username button
+        await page.wait_for_timeout(500)
+        await frame.locator('input[name="txtUserName"]').fill(PLANET_GPS_EMAIL)
+        await frame.locator('input[name="txtAccountPassword"]').fill(PLANET_GPS_PASSWORD)
+        
+        async with page.expect_navigation(wait_until="domcontentloaded", timeout=15000):
+            await frame.locator('input[name="btnLogin"]').click()
 
         final_url = page.url
         print(f"Playwright final URL: {final_url}")
