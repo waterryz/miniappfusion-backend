@@ -343,11 +343,14 @@ def create_app() -> web.Application:
     app = web.Application(middlewares=[cors_middleware])
     app.router.add_get("/me", handle_me)
     app.router.add_get("/drivers", handle_drivers)
+    app.router.add_post("/drivers", handle_add_driver)      # ← добавить
+    app.router.add_get("/driver/{id}", handle_driver)        # ← добавить
     app.router.add_get("/driver/{id}/files", handle_driver_files)
     app.router.add_post("/driver/{id}/upload", handle_upload)
+    app.router.add_delete("/driver/{id}", handle_delete_driver)  # ← добавить
+    app.router.add_delete("/file", handle_delete_file)           # ← добавить
     app.router.add_get("/api/fleet", handle_fleet)
     return app
-
 
 async def start_server():
     app = create_app()
