@@ -386,6 +386,7 @@ def create_app() -> web.Application:
     app.router.add_post("/driver/{id}/upload", handle_upload)
     app.router.add_delete("/file", handle_file_delete)
     app.router.add_get("/api/fleet", handle_fleet)
+    app.router.add_get("/api/fleet/report", handle_fleet_report)
     for path in ["/me", "/drivers", "/driver/{id}", "/driver/{id}/upload", "/file", "/api/fleet"]:
         app.router.add_options(path, lambda r: web.Response())
     return app
