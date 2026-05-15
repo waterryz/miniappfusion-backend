@@ -132,6 +132,7 @@ async def planet_gps_login() -> bool:
 
 async def handle_fleet(request: web.Request):
     user = get_user_from_request(request)
+    print(f"Fleet request, user: {user}, headers: {dict(request.headers)}")
     if not user or user.get("id") not in ALLOWED_ADMINS:
         return web.json_response({"error": "Forbidden"}, status=403)
 
