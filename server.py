@@ -318,6 +318,51 @@ async def handle_fleet(request: web.Request):
         _gps_cookies = None
         _gps_session = None
         return web.json_response({"error": str(e)}, status=500)
+
+async def handle_fleet_report(request: web.Request):
+    if not is_admin_request(request):
+        return web.json_response({"error": "Forbidden"}, status=403)
+
+    params = request.rel_url.query
+    start = params.get("from", "")
+    end = params.get("to", "")
+    if not start or not end:
+        return web.json_response({"error": "Missing from/to"}, status=400)
+
+    global _gps_session, _gps_cookies
+    if not _gps_cookies:
+        ok = await planet_gps_login_playwright()
+        if not ok:
+            return web.json_response({"error": "PlanetGPS login failed"}, status=502)
+        from aiohttp import ClientSession, CookieJar
+        from yarl import URL
+        jar = CookieJar(unsafe=True)
+        _gps_session = ClientSession(cookie_jar=jar)
+        jar.update_cookies(_gps_cookies, response_url=URL("https://web.planetgps.com"))
+
+    payload = f'{{"UserID":272967,"TimeZones":"5:00","StartDates":"{start}","EndDates":"{end}","DeviceID":0}}'
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "Referer": "https://web.planetgps.com/Report/Report.aspx?id=272967&deviceid=0&randon=21896",
+        "Origin": "https://web.planetgps.com",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "X-Requested-With": "XMLHttpRequest",
+    }
+    try:
+        async with _gps_session.post(
+            "https://web.planetgps.com/Ajax/ReportAjax.asmx/GetReportOverview",
+            data=payload, headers=headers
+        ) as resp:
+            data = await resp.json(content_type=None)
+            print(f"Report response: {str(data)[:300]}")
+            if "d" not in data:
+                _gps_cookies = None
+                _gps_session = None
+                return web.json_response({"error": "Session expired"}, status=503)
+            return web.json_response(data)
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=500)
 # ================== CORS MIDDLEWARE ==================
 @web.middleware
 async def cors_middleware(request, handler):
