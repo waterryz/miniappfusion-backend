@@ -146,12 +146,10 @@ async def handle_fleet(request: web.Request):
     if not user or user.get("id") not in ALLOWED_ADMINS:
         return web.json_response({"error": "Forbidden"}, status=403)
 
-    global _gps_session, _gps_token
-
-    if not _gps_token:
-        ok = await planet_gps_login()
-        if not ok:
-            return web.json_response({"error": "PlanetGPS login failed"}, status=502)
+    global _gps_session
+    if not _gps_session:
+        jar = CookieJar(unsafe=True)
+        _gps_session = ClientSession(cookie_jar=jar)
 
     payload = {
         "UserID": int(PLANET_GPS_USER_ID),
@@ -161,7 +159,7 @@ async def handle_fleet(request: web.Request):
     }
     api_headers = {
         "Content-Type": "application/json",
-        "Referer": f"https://web.planetgps.com/IframeMap.aspx?id={PLANET_GPS_USER_ID}&n={PLANET_GPS_EMAIL}&m=Gaode2&p={_gps_token}",
+        "Referer": f"https://web.planetgps.com/IframeMap.aspx?id={PLANET_GPS_USER_ID}&n={PLANET_GPS_EMAIL}&m=Gaode2&p=PSX40FI533fe73f05",
         "Origin": "https://web.planetgps.com",
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
     }
@@ -172,15 +170,12 @@ async def handle_fleet(request: web.Request):
             json=payload, headers=api_headers
         ) as resp:
             data = await resp.json(content_type=None)
+            print(f"Fleet API response: {str(data)[:200]}")
             if "d" not in data:
-                print(f"No 'd' in response: {data}")
-                _gps_token = None
-                return web.json_response({"error": "Session expired"}, status=503)
+                return web.json_response({"error": "No data"}, status=503)
             return web.json_response(data)
     except Exception as e:
-        _gps_token = None
         return web.json_response({"error": str(e)}, status=500)
-
 
 # ================== HELPERS ==================
 def load_drivers() -> dict:
