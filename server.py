@@ -238,40 +238,36 @@ async def handle_fleet(request: web.Request):
 
     global _gps_session
     if not _gps_session:
+        from yarl import URL
         jar = CookieJar(unsafe=True)
         _gps_session = ClientSession(cookie_jar=jar)
-        # Set cookies from env
-        _gps_session.cookie_jar.update_cookies({
+        jar.update_cookies({
             "ASP.NET_SessionId": os.getenv("GPS_SESSION_ID", ""),
             "HMACCOUNT": os.getenv("GPS_HMACCOUNT", ""),
-            "HSID": os.getenv("GPS_HSID", ""),
+            "Language": "lan=en-us",
+            "Hm_lvt_47a62b648199a5f6d1bcbb82b31e9491": "1777895456",
+            "Hm_lpvt_47a62b648199a5f6d1bcbb82b31e9491": "1778859161",
         }, response_url=URL("https://web.planetgps.com"))
 
-    payload = {
-        "UserID": int(PLANET_GPS_USER_ID),
-        "isFirst": True,
-        "TimeZones": "-4:00",
-        "DeviceId": 0
-    }
+    payload = '{"UserID":272967,"isFirst":false,"TimeZones":"5:00","DeviceID":0}'
     headers = {
         "Content-Type": "application/json",
-        "Referer": "https://web.planetgps.com/Monitor.aspx",
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "Referer": "https://web.planetgps.com/map.aspx?id=272967&n=alexyss.waterry%40icloud.com&p=1MM40YM033fe73f05",
         "Origin": "https://web.planetgps.com",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36",
+        "X-Requested-With": "XMLHttpRequest",
     }
     try:
         async with _gps_session.post(
             "https://web.planetgps.com/Ajax/DevicesAjax.asmx/GetDevicesByUserID",
-            json=payload, headers=headers
+            data=payload, headers=headers
         ) as resp:
             data = await resp.json(content_type=None)
             print(f"Fleet response: {str(data)[:200]}")
             if "d" not in data:
                 return web.json_response({"error": "No data"}, status=503)
-            return web.json_response(data)
-    except Exception as e:
-        return web.json_response({"error": str(e)}, status=500)
-
+            retur
 # ================== CORS MIDDLEWARE ==================
 @web.middleware
 async def cors_middleware(request, handler):
