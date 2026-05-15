@@ -70,6 +70,105 @@ def require_admin(handler):
         return await handler(request)
     return wrapper
 
+
+import re
+from aiohttp import ClientSession, CookieJar
+
+PLANET_GPS_EMAIL = os.getenv("PLANET_GPS_EMAIL")
+PLANET_GPS_PASSWORD = os.getenv("PLANET_GPS_PASSWORD")
+PLANET_GPS_USER_ID = "272967"
+
+_gps_session: ClientSession | None = None
+_gps_token: str | None = None
+
+async def planet_gps_login() -> bool:
+    global _gps_session, _gps_token
+    
+    try:
+        jar = CookieJar(unsafe=True)
+        if _gps_session:
+            await _gps_session.close()
+        _gps_session = ClientSession(cookie_jar=jar)
+        
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        }
+        
+        # GET login page
+        login_url = "https://web.planetgps.com/Login.aspx"
+        async with _gps_session.get(login_url, headers=headers) as resp:
+            html = await resp.text()
+        
+        # Extract ASP.NET hidden fields
+        fields = {}
+        for field in ["__VIEWSTATE", "__VIEWSTATEGENERATOR", "__EVENTVALIDATION"]:
+            m = re.search(rf'id="{field}"[^>]*value="([^"]*)"', html)
+            fields[field] = m.group(1) if m else ""
+        
+        # POST login
+        data = {
+            **fields,
+            "txtUserName": PLANET_GPS_EMAIL,
+            "txtPassword": PLANET_GPS_PASSWORD,
+            "btnLogin": "Log+In",
+        }
+        
+        async with _gps_session.post(
+            login_url, data=data, headers=headers, allow_redirects=True
+        ) as resp:
+            final_url = str(resp.url)
+            m = re.search(r'[?&]p=([^&]+)', final_url)
+            if m:
+                _gps_token = m.group(1)
+                print(f"PlanetGPS login OK, token: {_gps_token}")
+                return True
+        
+        print(f"PlanetGPS login failed, final URL: {final_url}")
+        return False
+    except Exception as e:
+        print(f"PlanetGPS login error: {e}")
+        return False
+
+
+async def handle_fleet(request: web.Request):
+    user = get_user_from_request(request)
+    if not user or user.get("id") not in ALLOWED_ADMINS:
+        return web.json_response({"error": "Forbidden"}, status=403)
+
+    global _gps_session, _gps_token
+
+    if not _gps_token:
+        ok = await planet_gps_login()
+        if not ok:
+            return web.json_response({"error": "PlanetGPS login failed"}, status=502)
+
+    payload = {
+        "UserID": int(PLANET_GPS_USER_ID),
+        "isFirst": True,
+        "TimeZones": "-4:00",
+        "DeviceId": 0
+    }
+    headers = {
+        "Content-Type": "application/json",
+        "Referer": f"https://web.planetgps.com/IframeMap.aspx?id={PLANET_GPS_USER_ID}&n={PLANET_GPS_EMAIL}&m=Gaode2&p={_gps_token}",
+        "Origin": "https://web.planetgps.com",
+    }
+
+    try:
+        async with _gps_session.post(
+            "https://web.planetgps.com/Ajax/DevicesAjax.asmx/GetDevicesByUserID",
+            json=payload, headers=headers
+        ) as resp:
+            data = await resp.json(content_type=None)
+            # Token expired — re-login next time
+            if "d" not in data:
+                _gps_token = None
+                return web.json_response({"error": "Session expired"}, status=503)
+            return web.json_response(data)
+    except Exception as e:
+        _gps_token = None
+        return web.json_response({"error": str(e)}, status=500)
+
 # ================== HELPERS ==================
 def load_drivers() -> dict:
     if not os.path.exists(DATA_PATH):
