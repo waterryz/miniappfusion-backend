@@ -108,7 +108,7 @@ async def get_monthly_mileage(device_id: str) -> str | None:
         "TimeZones": "5:00",
         "StartDates": start,
         "EndDates": end,
-        "DeviceID": int(device_id)
+        "DeviceID": 0
     })
     headers = {
         "Content-Type": "application/json",
@@ -131,10 +131,41 @@ async def get_monthly_mileage(device_id: str) -> str | None:
             fixed = _re.sub(r'([{,])\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*:', r'\1"\2":', raw)
             fixed = _re.sub(r":\s*'([^']*)'", r':"\1"', fixed)
             parsed = json.loads(fixed)
-            rows = parsed.get("reportList") or parsed.get("devices") or parsed.get("list") or []
+            rows = parsed.get("reports") or parsed.get("reportList") or parsed.get("devices") or parsed.get("list") or []
             if rows:
-                row = rows[0]
-                mileage = row.get("mileage") or row.get("Mileage") or row.get("distance") or "—"
+                # Find row matching device_id by cross-referencing fleet data
+                # First try exact device id match
+                row = next((r for r in rows if str(r.get("deviceID") or r.get("DeviceID") or "") == str(device_id)), None)
+                # If not found, get fleet data to match by name
+                if not row:
+                    try:
+                        fleet_payload = '{"UserID":272967,"isFirst":true,"TimeZones":"5:00","DeviceID":0}'
+                        fleet_headers = {
+                            "Content-Type": "application/json",
+                            "Referer": "https://web.planetgps.com/Monitor.aspx",
+                            "Origin": "https://web.planetgps.com",
+                            "User-Agent": "Mozilla/5.0",
+                            "X-Requested-With": "XMLHttpRequest",
+                        }
+                        async with _gps_session.post(
+                            "https://web.planetgps.com/Ajax/DevicesAjax.asmx/GetDevicesByUserID",
+                            data=fleet_payload, headers=fleet_headers
+                        ) as fr:
+                            fdata = await fr.json(content_type=None)
+                            if fdata.get("d"):
+                                fraw = fdata["d"]
+                                ffixed = _re.sub(r'([{,])\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*:', r'\1"\2":', fraw)
+                                ffixed = _re.sub(r":\s*'([^']*)'", r':"\1"', ffixed)
+                                fdevices = json.loads(ffixed).get("devices", [])
+                                device = next((d for d in fdevices if str(d.get("id", "")) == str(device_id)), None)
+                                if device:
+                                    dname = device.get("name", "").lower()
+                                    row = next((r for r in rows if r.get("name", "").lower() == dname), None)
+                    except Exception as fe:
+                        print(f"Fleet lookup error: {fe}")
+                if not row:
+                    row = rows[0]
+                mileage = row.get("distance") or row.get("mileage") or row.get("Mileage") or "—"
                 return str(mileage)
             return "0"
     except Exception as e:
