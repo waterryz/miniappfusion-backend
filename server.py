@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 
 # ================== CONFIG ==================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-ALLOWED_ADMINS = {547004364}
+ALLOWED_ADMINS = {5348697217, 547004364}
 DATA_PATH = "/data/drivers.json"
 
 cloudinary.config(
@@ -358,6 +358,17 @@ async def handle_driver_me(request: web.Request):
     })
 
 
+# ================== MILEAGE ENDPOINT ==================
+
+async def handle_mileage(request: web.Request):
+    """GET /api/mileage/{device_id} — monthly mileage for a specific device."""
+    device_id = request.match_info["device_id"]
+    if not device_id:
+        return web.json_response({"mileage": None})
+    mileage = await get_monthly_mileage(device_id)
+    return web.json_response({"mileage": mileage})
+
+
 # ================== FLEET ==================
 from playwright.async_api import async_playwright
 
@@ -577,11 +588,13 @@ def create_app() -> web.Application:
     app.router.add_post("/driver/{id}/upload", handle_upload)
     app.router.add_delete("/file", handle_file_delete)
     app.router.add_get("/api/fleet", handle_fleet)
+    app.router.add_get("/api/mileage/{device_id}", handle_mileage)
     app.router.add_get("/api/fleet/report", handle_fleet_report)
     app.router.add_get("/api/fleet/report/excel", handle_fleet_report_excel)
     options_paths = [
         "/me", "/drivers", "/driver/me", "/driver/{id}",
         "/driver/{id}/upload", "/file", "/api/fleet",
+        "/api/mileage/{device_id}",
         "/api/fleet/report", "/api/fleet/report/excel"
     ]
     for path in options_paths:
