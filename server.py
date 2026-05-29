@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 
 # ================== CONFIG ==================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-ALLOWED_ADMINS = {5348697217, 547004364}
+ALLOWED_ADMINS = {547004364}
 DATA_PATH = "/data/drivers.json"
 
 cloudinary.config(
