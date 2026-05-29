@@ -11,10 +11,11 @@ import cloudinary.uploader
 import cloudinary.api
 import base64
 from yarl import URL
+from datetime import datetime, timezone
 
 # ================== CONFIG ==================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-ALLOWED_ADMINS = {5348697217, 547004364}
+ALLOWED_ADMINS = {}
 DATA_PATH = "/data/drivers.json"
 
 cloudinary.config(
@@ -86,6 +87,60 @@ def list_driver_files(folder: str) -> list[dict]:
     except Exception:
         return []
 
+# ================== MILEAGE HELPER ==================
+async def get_monthly_mileage(device_id: str) -> str | None:
+    """Fetch mileage for current month for a specific device from PlanetGPS report."""
+    global _gps_session, _gps_cookies
+    if not _gps_cookies:
+        ok = await planet_gps_login_playwright()
+        if not ok:
+            return None
+        jar = CookieJar(unsafe=True)
+        _gps_session = ClientSession(cookie_jar=jar)
+        jar.update_cookies(_gps_cookies, response_url=URL("https://web.planetgps.com"))
+
+    now = datetime.now(timezone.utc)
+    start = f"{now.year}-{now.month:02d}-01 00:00"
+    end = f"{now.year}-{now.month:02d}-{now.day:02d} 23:59"
+
+    payload = json.dumps({
+        "UserID": 272967,
+        "TimeZones": "5:00",
+        "StartDates": start,
+        "EndDates": end,
+        "DeviceID": int(device_id)
+    })
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "Referer": "https://web.planetgps.com/Report/Report.aspx",
+        "Origin": "https://web.planetgps.com",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "X-Requested-With": "XMLHttpRequest",
+    }
+    try:
+        async with _gps_session.post(
+            "https://web.planetgps.com/Ajax/ReportAjax.asmx/GetReportOverview",
+            data=payload, headers=headers
+        ) as resp:
+            data = await resp.json(content_type=None)
+            if "d" not in data or not data["d"]:
+                return None
+            import re as _re
+            raw = data["d"]
+            fixed = _re.sub(r'([{,])\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*:', r'\1"\2":', raw)
+            fixed = _re.sub(r":\s*'([^']*)'", r':"\1"', fixed)
+            parsed = json.loads(fixed)
+            rows = parsed.get("reportList") or parsed.get("devices") or parsed.get("list") or []
+            if rows:
+                row = rows[0]
+                mileage = row.get("mileage") or row.get("Mileage") or row.get("distance") or "—"
+                return str(mileage)
+            return "0"
+    except Exception as e:
+        print(f"Mileage fetch error: {e}")
+        return None
+
 # ================== ROUTES ==================
 
 async def handle_me(request: web.Request):
@@ -114,6 +169,7 @@ async def handle_drivers(request: web.Request):
             "car_model": d.get("car_model", ""),
             "car_number": d.get("car_number", ""),
             "tariff": d.get("tariff", ""),
+            "planet_gps_device_id": d.get("planet_gps_device_id", ""),
             "file_count": len(files),
         })
     return web.json_response(result)
@@ -136,6 +192,7 @@ async def handle_driver_get(request: web.Request):
             "car_model": driver.get("car_model", ""),
             "car_number": driver.get("car_number", ""),
             "tariff": driver.get("tariff", ""),
+            "planet_gps_device_id": driver.get("planet_gps_device_id", ""),
         },
         "files": files,
     })
@@ -151,6 +208,7 @@ async def handle_driver_add(request: web.Request):
         car_model = body.get("car_model", "").strip()
         car_number = body.get("car_number", "").strip()
         tariff = body.get("tariff", "").strip()
+        planet_gps_device_id = body.get("planet_gps_device_id", "").strip()
         if not all([driver_id, name, car_model, car_number, tariff]):
             return web.json_response({"error": "All fields required"}, status=400)
         if not driver_id.isdigit():
@@ -158,9 +216,35 @@ async def handle_driver_add(request: web.Request):
         drivers = load_drivers()
         if driver_id in drivers:
             return web.json_response({"error": "Driver with this ID already exists"}, status=409)
-        drivers[driver_id] = {"name": name, "car_model": car_model, "car_number": car_number, "tariff": tariff}
+        drivers[driver_id] = {
+            "name": name,
+            "car_model": car_model,
+            "car_number": car_number,
+            "tariff": tariff,
+            "planet_gps_device_id": planet_gps_device_id,
+        }
         save_drivers(drivers)
         return web.json_response({"success": True, "id": driver_id})
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=500)
+
+
+async def handle_driver_update(request: web.Request):
+    """Update driver fields (admin only). Used to set planet_gps_device_id on existing drivers."""
+    if not is_admin_request(request):
+        return web.json_response({"error": "Forbidden"}, status=403)
+    driver_id = request.match_info["id"]
+    drivers = load_drivers()
+    if driver_id not in drivers:
+        return web.json_response({"error": "Driver not found"}, status=404)
+    try:
+        body = await request.json()
+        updatable = ["car_model", "car_number", "tariff", "planet_gps_device_id"]
+        for field in updatable:
+            if field in body:
+                drivers[driver_id][field] = str(body[field]).strip()
+        save_drivers(drivers)
+        return web.json_response({"success": True})
     except Exception as e:
         return web.json_response({"error": str(e)}, status=500)
 
@@ -227,6 +311,53 @@ async def handle_file_delete(request: web.Request):
         return web.json_response({"error": str(e)}, status=500)
 
 
+# ================== DRIVER SELF-VIEW ==================
+
+async def handle_driver_me(request: web.Request):
+    """
+    Driver-facing endpoint. Returns own profile + documents + monthly mileage.
+    Auth: any valid Telegram user whose ID exists in drivers.json.
+    """
+    user = get_user_from_request(request)
+    if not user:
+        return web.json_response({"error": "Unauthorized"}, status=401)
+
+    user_id = str(user.get("id", ""))
+    drivers = load_drivers()
+
+    if user_id not in drivers:
+        return web.json_response({"error": "Not registered"}, status=403)
+
+    driver = drivers[user_id]
+    folder = get_driver_folder(user_id, driver["name"])
+    files = list_driver_files(folder)
+
+    # Fetch mileage if device_id is set
+    mileage = None
+    device_id = driver.get("planet_gps_device_id", "")
+    if device_id:
+        mileage = await get_monthly_mileage(device_id)
+
+    now = datetime.now(timezone.utc)
+    month_label = now.strftime("%B %Y")
+
+    return web.json_response({
+        "driver": {
+            "id": user_id,
+            "name": driver["name"],
+            "car_model": driver.get("car_model", ""),
+            "car_number": driver.get("car_number", ""),
+            "tariff": driver.get("tariff", ""),
+        },
+        "files": files,
+        "mileage": {
+            "value": mileage,
+            "month": month_label,
+            "has_gps": bool(device_id),
+        }
+    })
+
+
 # ================== FLEET ==================
 from playwright.async_api import async_playwright
 
@@ -251,9 +382,8 @@ async def planet_gps_login_playwright() -> bool:
         await page.goto("https://web.planetgps.com/index.aspx", wait_until="domcontentloaded")
         await page.wait_for_timeout(2000)
         
-        # Login page is in an iframe
         frame = page.frame_locator("iframe#ifm")
-        await frame.locator("#changBar0").click()  # Login by Username button
+        await frame.locator("#changBar0").click()
         await page.wait_for_timeout(500)
         await frame.locator('input[name="txtUserName"]').fill(PLANET_GPS_EMAIL)
         await frame.locator('input[name="txtAccountPassword"]').fill(PLANET_GPS_PASSWORD)
@@ -287,8 +417,6 @@ async def handle_fleet(request: web.Request):
             return web.json_response({"error": "PlanetGPS login failed"}, status=502)
 
     if not _gps_session:
-        from aiohttp import ClientSession, CookieJar
-        from yarl import URL
         jar = CookieJar(unsafe=True)
         _gps_session = ClientSession(cookie_jar=jar)
         jar.update_cookies(_gps_cookies, response_url=URL("https://web.planetgps.com"))
@@ -319,6 +447,7 @@ async def handle_fleet(request: web.Request):
         _gps_session = None
         return web.json_response({"error": str(e)}, status=500)
 
+
 async def handle_fleet_report(request: web.Request):
     if not is_admin_request(request):
         return web.json_response({"error": "Forbidden"}, status=403)
@@ -334,8 +463,6 @@ async def handle_fleet_report(request: web.Request):
         ok = await planet_gps_login_playwright()
         if not ok:
             return web.json_response({"error": "PlanetGPS login failed"}, status=502)
-        from aiohttp import ClientSession, CookieJar
-        from yarl import URL
         jar = CookieJar(unsafe=True)
         _gps_session = ClientSession(cookie_jar=jar)
         jar.update_cookies(_gps_cookies, response_url=URL("https://web.planetgps.com"))
@@ -380,13 +507,10 @@ async def handle_fleet_report_excel(request: web.Request):
         ok = await planet_gps_login_playwright()
         if not ok:
             return web.json_response({"error": "Login failed"}, status=502)
-        from aiohttp import ClientSession, CookieJar
-        from yarl import URL
         jar = CookieJar(unsafe=True)
         _gps_session = ClientSession(cookie_jar=jar)
         jar.update_cookies(_gps_cookies, response_url=URL("https://web.planetgps.com"))
 
-    # First get the report page to get VIEWSTATE
     report_url = f"https://web.planetgps.com/Report/Report.aspx?id={PLANET_GPS_USER_ID}&deviceid=0&randon=12345"
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
@@ -419,7 +543,6 @@ async def handle_fleet_report_excel(request: web.Request):
     try:
         async with _gps_session.post(report_url, data=data, headers=post_headers) as resp:
             content = await resp.read()
-            content_type = resp.headers.get("Content-Type", "application/octet-stream")
             return web.Response(
                 body=content,
                 content_type="application/vnd.ms-excel",
@@ -427,6 +550,8 @@ async def handle_fleet_report_excel(request: web.Request):
             )
     except Exception as e:
         return web.json_response({"error": str(e)}, status=500)
+
+
 # ================== CORS MIDDLEWARE ==================
 @web.middleware
 async def cors_middleware(request, handler):
@@ -436,7 +561,7 @@ async def cors_middleware(request, handler):
         response = await handler(request)
     response.headers["Access-Control-Allow-Origin"] = "*"
     response.headers["Access-Control-Allow-Headers"] = "Content-Type, X-Telegram-Init-Data"
-    response.headers["Access-Control-Allow-Methods"] = "GET, POST, DELETE, OPTIONS"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, PATCH, DELETE, OPTIONS"
     return response
 
 
@@ -445,14 +570,21 @@ def create_app() -> web.Application:
     app.router.add_get("/me", handle_me)
     app.router.add_get("/drivers", handle_drivers)
     app.router.add_post("/drivers", handle_driver_add)
+    app.router.add_get("/driver/me", handle_driver_me)          # NEW: driver self-view
     app.router.add_get("/driver/{id}", handle_driver_get)
+    app.router.add_patch("/driver/{id}", handle_driver_update)  # NEW: update device_id
     app.router.add_delete("/driver/{id}", handle_driver_delete)
     app.router.add_post("/driver/{id}/upload", handle_upload)
     app.router.add_delete("/file", handle_file_delete)
     app.router.add_get("/api/fleet", handle_fleet)
     app.router.add_get("/api/fleet/report", handle_fleet_report)
     app.router.add_get("/api/fleet/report/excel", handle_fleet_report_excel)
-    for path in ["/me", "/drivers", "/driver/{id}", "/driver/{id}/upload", "/file", "/api/fleet"]:
+    options_paths = [
+        "/me", "/drivers", "/driver/me", "/driver/{id}",
+        "/driver/{id}/upload", "/file", "/api/fleet",
+        "/api/fleet/report", "/api/fleet/report/excel"
+    ]
+    for path in options_paths:
         app.router.add_options(path, lambda r: web.Response())
     return app
 
