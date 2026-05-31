@@ -591,11 +591,66 @@ async def handle_fleet_report_excel(request: web.Request):
     try:
         async with _gps_session.post(report_url, data=data, headers=post_headers) as resp:
             content = await resp.read()
-            return web.Response(
-                body=content,
-                content_type="application/vnd.ms-excel",
-                headers={"Content-Disposition": f'attachment; filename="report_{start[:10]}_{end[:10]}.xls"'}
-            )
+
+        # Convert km to miles using openpyxl
+        try:
+            import io
+            import openpyxl
+            wb = openpyxl.load_workbook(io.BytesIO(content))
+            for ws in wb.worksheets:
+                # Find header row to locate mileage column
+                header_row = None
+                mileage_col = None
+                iskm_col = None
+                for row in ws.iter_rows():
+                    for cell in row:
+                        if cell.value and isinstance(cell.value, str):
+                            v = cell.value.strip().lower()
+                            if v in ('mileage', 'distance', 'пробег', 'miles'):
+                                mileage_col = cell.column
+                                header_row = cell.row
+                            if v == 'iskm':
+                                iskm_col = cell.column
+                    if header_row:
+                        break
+
+                if mileage_col and header_row:
+                    for row in ws.iter_rows(min_row=header_row + 1):
+                        mileage_cell = None
+                        iskm_val = "1"  # default: assume km
+                        for cell in row:
+                            if cell.column == mileage_col:
+                                mileage_cell = cell
+                            if iskm_col and cell.column == iskm_col:
+                                iskm_val = str(cell.value or "1")
+                        if mileage_cell and mileage_cell.value is not None:
+                            try:
+                                if iskm_val == "1":
+                                    mileage_cell.value = round(float(mileage_cell.value) * 0.621371, 2)
+                            except Exception:
+                                pass
+
+                # Also rename header
+                if mileage_col and header_row:
+                    cell = ws.cell(row=header_row, column=mileage_col)
+                    if cell.value:
+                        cell.value = "Mileage (mi)"
+
+            out = io.BytesIO()
+            wb.save(out)
+            content = out.getvalue()
+            filename = f"report_{start[:10]}_{end[:10]}_miles.xlsx"
+            content_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        except Exception as e:
+            print(f"Excel conversion error: {e}")
+            filename = f"report_{start[:10]}_{end[:10]}.xls"
+            content_type = "application/vnd.ms-excel"
+
+        return web.Response(
+            body=content,
+            content_type=content_type,
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'}
+        )
     except Exception as e:
         return web.json_response({"error": str(e)}, status=500)
 
