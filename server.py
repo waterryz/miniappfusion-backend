@@ -166,12 +166,11 @@ async def get_monthly_mileage(device_id: str) -> str | None:
                 if not row:
                     row = rows[0]
                 mileage = row.get("distance") or row.get("mileage") or row.get("Mileage") or "—"
-                # Convert km to miles if iskm == "1"
-                if str(row.get("iskm", "0")) == "1":
-                    try:
-                        mileage = round(float(mileage) * 0.621371, 2)
-                    except Exception:
-                        pass
+                # Always convert km to miles (API always returns km)
+                try:
+                    mileage = round(float(mileage) * 0.621371, 2)
+                except Exception:
+                    pass
                 return str(mileage)
             return "0"
     except Exception as e:
@@ -625,8 +624,8 @@ async def handle_fleet_report_excel(request: web.Request):
                                 iskm_val = str(cell.value or "1")
                         if mileage_cell and mileage_cell.value is not None:
                             try:
-                                if iskm_val == "1":
-                                    mileage_cell.value = round(float(mileage_cell.value) * 0.621371, 2)
+                                # Always convert km to miles
+                                mileage_cell.value = round(float(mileage_cell.value) * 0.621371, 2)
                             except Exception:
                                 pass
 
