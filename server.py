@@ -639,6 +639,29 @@ def create_app() -> web.Application:
     return app
 
 
+async def keep_gps_session_alive():
+    """Background task: re-login to PlanetGPS every 6 hours."""
+    global _gps_cookies, _gps_session
+    # Initial login at startup
+    await asyncio.sleep(5)
+    while True:
+        try:
+            print("Background GPS session refresh...")
+            ok = await planet_gps_login_playwright()
+            if ok:
+                if _gps_session:
+                    await _gps_session.close()
+                jar = CookieJar(unsafe=True)
+                _gps_session = ClientSession(cookie_jar=jar)
+                jar.update_cookies(_gps_cookies, response_url=URL("https://web.planetgps.com"))
+                print("GPS session refreshed OK")
+            else:
+                print("GPS session refresh FAILED")
+        except Exception as e:
+            print(f"GPS keepalive error: {e}")
+        await asyncio.sleep(6 * 3600)
+
+
 async def start_server():
     app = create_app()
     runner = web.AppRunner(app)
@@ -647,6 +670,7 @@ async def start_server():
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
     print(f"API server running on port {port}")
+    asyncio.create_task(keep_gps_session_alive())
     await asyncio.Event().wait()
 
 if __name__ == "__main__":
