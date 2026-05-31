@@ -2,3 +2,4 @@ aiogram
 aiohttp
 cloudinary
 playwright
+openpyxl
