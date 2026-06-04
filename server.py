@@ -697,7 +697,7 @@ async def keep_gps_session_alive():
     """Background task: re-login to PlanetGPS every 6 hours."""
     global _gps_cookies, _gps_session
     # Initial login at startup
-    await asyncio.sleep(5)
+    await asyncio.sleep(30)
     while True:
         try:
             print("Background GPS session refresh...")
