@@ -713,7 +713,7 @@ async def keep_gps_session_alive():
                 print("GPS session refresh FAILED")
         except Exception as e:
             print(f"GPS keepalive error: {e}")
-        await asyncio.sleep(6 * 3600)
+        await asyncio.sleep(6 * 1800)
 
 
 async def start_server():
