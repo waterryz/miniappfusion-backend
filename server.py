@@ -1,22 +1,44 @@
 import asyncio
+import base64
 import hashlib
 import hmac
+import io
 import json
 import os
+import re
+import subprocess
+import sys
 import time
 import urllib.parse
-from aiohttp import web, ClientSession, CookieJar
-import cloudinary
-import cloudinary.uploader
-import cloudinary.api
-import base64
-from yarl import URL
 from datetime import datetime, timezone
+
+import cloudinary
+import cloudinary.api
+import cloudinary.uploader
+import openpyxl
+from aiohttp import ClientSession, ClientTimeout, CookieJar, web
+from playwright.async_api import async_playwright
+from yarl import URL
 
 # ================== CONFIG ==================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ALLOWED_ADMINS = {5348697217, 547004364}
 DATA_PATH = "/data/drivers.json"
+
+PLANET_GPS_BASE = "https://web.planetgps.com"
+PLANET_GPS_EMAIL = os.getenv("PLANET_GPS_EMAIL", "alexyss.waterry@icloud.com")
+PLANET_GPS_PASSWORD = os.getenv("PLANET_GPS_PASSWORD", "")
+PLANET_GPS_USER_ID = 272967
+
+GPS_HTTP_TIMEOUT = ClientTimeout(total=30)
+GPS_REPORT_TIMEOUT = ClientTimeout(total=180)  # Excel export can take minutes to build
+GPS_PING_INTERVAL = 600          # keepalive ping every 10 min (ASP.NET sessions are sliding)
+GPS_LOGIN_MAX_BACKOFF = 1800     # cap on the delay between failed login attempts
+
+if not BOT_TOKEN:
+    print("WARNING: BOT_TOKEN is not set — Telegram auth will reject everyone")
+if not PLANET_GPS_PASSWORD:
+    print("WARNING: PLANET_GPS_PASSWORD is not set — GPS login will fail")
 
 cloudinary.config(
     cloud_name=os.getenv("CLOUDINARY_CLOUD_NAME"),
@@ -58,13 +80,19 @@ def is_admin_request(request: web.Request) -> bool:
 def load_drivers() -> dict:
     if not os.path.exists(DATA_PATH):
         return {}
-    with open(DATA_PATH, "r") as f:
-        return json.load(f)
+    try:
+        with open(DATA_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError) as e:
+        print(f"drivers.json read error: {e}")
+        return {}
 
 def save_drivers(data: dict):
     os.makedirs(os.path.dirname(DATA_PATH), exist_ok=True)
-    with open(DATA_PATH, "w") as f:
+    tmp = DATA_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=4, ensure_ascii=False)
+    os.replace(tmp, DATA_PATH)
 
 def get_driver_folder(driver_id: str, driver_name: str) -> str:
     name = driver_name.replace(" ", "_")
@@ -87,94 +115,253 @@ def list_driver_files(folder: str) -> list[dict]:
     except Exception:
         return []
 
+# ================== PLANET GPS: SESSION CORE ==================
+_gps_session: ClientSession | None = None
+_gps_cookies: dict | None = None
+_gps_lock = asyncio.Lock()
+_login_fail_streak = 0
+_next_login_allowed = 0.0  # time.monotonic() deadline
+
+FLEET_PAYLOAD = json.dumps({
+    "UserID": PLANET_GPS_USER_ID, "isFirst": True, "TimeZones": "5:00", "DeviceID": 0
+})
+
+GPS_BASE_HEADERS = {
+    "Content-Type": "application/json",
+    "Accept": "application/json, text/javascript, */*; q=0.01",
+    "Origin": PLANET_GPS_BASE,
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "X-Requested-With": "XMLHttpRequest",
+}
+
+
+def _kill_stray_browsers():
+    """Safety net: reap zombie headless-chrome processes from failed launches."""
+    if not sys.platform.startswith("linux"):
+        return
+    try:
+        subprocess.run(["pkill", "-f", "chrome-headless-shell"],
+                       capture_output=True, timeout=10)
+    except Exception:
+        pass
+
+
+async def planet_gps_login_playwright() -> bool:
+    """Log in via headless browser and stash the session cookies.
+
+    The browser AND the playwright driver process are always closed, even on
+    failure — leaking them exhausts the container's threads/PIDs and
+    eventually makes every launch fail with pthread_create EAGAIN.
+    """
+    global _gps_cookies
+    pw = None
+    browser = None
+    try:
+        print("Starting Playwright login...")
+        await asyncio.to_thread(_kill_stray_browsers)
+        pw = await async_playwright().start()
+        browser = await pw.chromium.launch(
+            headless=True,
+            args=["--no-zygote", "--disable-gpu"],
+        )
+        context = await browser.new_context()
+        page = await context.new_page()
+
+        await page.goto(f"{PLANET_GPS_BASE}/index.aspx", wait_until="domcontentloaded")
+        await page.wait_for_timeout(2000)
+
+        frame = page.frame_locator("iframe#ifm")
+        await frame.locator("#changBar0").click()
+        await page.wait_for_timeout(500)
+        await frame.locator('input[name="txtUserName"]').fill(PLANET_GPS_EMAIL)
+        await frame.locator('input[name="txtAccountPassword"]').fill(PLANET_GPS_PASSWORD)
+
+        async with page.expect_navigation(wait_until="domcontentloaded", timeout=15000):
+            await frame.locator('input[name="btnLogin"]').click()
+
+        final_url = page.url
+        print(f"Playwright final URL: {final_url}")
+
+        cookies = await context.cookies()
+        ok = "Monitor.aspx" in final_url or "p=" in final_url
+        if ok:
+            _gps_cookies = {c["name"]: c["value"] for c in cookies}
+            print(f"Got cookies: {list(_gps_cookies.keys())}")
+        return ok
+    except Exception as e:
+        print(f"Playwright login error: {e}")
+        return False
+    finally:
+        try:
+            if browser:
+                await browser.close()
+        except Exception:
+            pass
+        try:
+            if pw:
+                await pw.stop()
+        except Exception:
+            pass
+
+
+async def _close_gps_session():
+    global _gps_session
+    sess, _gps_session = _gps_session, None
+    if sess and not sess.closed:
+        try:
+            await sess.close()
+        except Exception:
+            pass
+
+
+async def _invalidate_gps_session(sess: ClientSession | None = None):
+    """Drop the cached cookies/session so the next call re-logs in.
+
+    When `sess` is given, only invalidate if it is still the live session — a
+    concurrent caller may already have rebuilt it, and we must not stomp the
+    fresh one. The stale session is closed either way.
+    """
+    global _gps_cookies
+    if sess is not None and sess is not _gps_session:
+        if not sess.closed:
+            try:
+                await sess.close()
+            except Exception:
+                pass
+        return
+    _gps_cookies = None
+    await _close_gps_session()
+
+
+def _build_gps_session() -> ClientSession | None:
+    cookies = _gps_cookies
+    if not cookies:
+        return None
+    jar = CookieJar(unsafe=True)
+    sess = ClientSession(cookie_jar=jar, timeout=GPS_HTTP_TIMEOUT)
+    jar.update_cookies(cookies, response_url=URL(PLANET_GPS_BASE))
+    return sess
+
+
+async def ensure_gps_session() -> ClientSession | None:
+    """Return a logged-in ClientSession, re-logging in when needed.
+
+    Single-flight: concurrent callers share one login attempt instead of each
+    launching a browser. Failed logins back off exponentially so a flood of
+    requests can't turn into a browser storm.
+    """
+    global _gps_session, _login_fail_streak, _next_login_allowed
+    if _gps_cookies and _gps_session and not _gps_session.closed:
+        return _gps_session
+    async with _gps_lock:
+        if _gps_cookies and _gps_session and not _gps_session.closed:
+            return _gps_session
+        if not _gps_cookies:
+            if time.monotonic() < _next_login_allowed:
+                return None
+            ok = await planet_gps_login_playwright()
+            if not ok:
+                _login_fail_streak += 1
+                backoff = min(GPS_LOGIN_MAX_BACKOFF, 60 * 2 ** min(_login_fail_streak - 1, 5))
+                _next_login_allowed = time.monotonic() + backoff
+                print(f"GPS login failed, next attempt in {backoff}s")
+                return None
+            _login_fail_streak = 0
+            _next_login_allowed = 0.0
+        await _close_gps_session()
+        _gps_session = _build_gps_session()
+        return _gps_session
+
+
+async def gps_post(path: str, payload: str, referer: str) -> dict | None:
+    """POST to a PlanetGPS Ajax endpoint, re-logging in once if the session
+    has expired. Returns the parsed JSON dict or None when GPS is unreachable.
+    """
+    headers = {**GPS_BASE_HEADERS, "Referer": referer}
+    for attempt in range(2):
+        sess = await ensure_gps_session()
+        if sess is None:
+            return None
+        try:
+            async with sess.post(f"{PLANET_GPS_BASE}{path}",
+                                 data=payload, headers=headers) as resp:
+                data = await resp.json(content_type=None)
+            # A live PlanetGPS session always answers with a non-empty "d".
+            # Missing/empty "d" means the cookie died — re-login and retry,
+            # and never hand a bodyless response back to a handler as success.
+            if isinstance(data, dict) and data.get("d"):
+                return data
+            print(f"GPS response missing data (attempt {attempt + 1}): {str(data)[:200]}")
+        except Exception as e:
+            print(f"GPS request error (attempt {attempt + 1}): {e}")
+        await _invalidate_gps_session(sess)
+    return None
+
+
+def _parse_relaxed_json(raw: str) -> dict:
+    """PlanetGPS returns JS object literals (unquoted keys, single quotes)."""
+    fixed = re.sub(r'([{,])\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*:', r'\1"\2":', raw)
+    fixed = re.sub(r":\s*'([^']*)'", r':"\1"', fixed)
+    return json.loads(fixed)
+
 # ================== MILEAGE HELPER ==================
 async def get_monthly_mileage(device_id: str) -> str | None:
-    """Fetch mileage for current month for a specific device from PlanetGPS report."""
-    global _gps_session, _gps_cookies
-    if not _gps_cookies:
-        ok = await planet_gps_login_playwright()
-        if not ok:
-            return None
-        jar = CookieJar(unsafe=True)
-        _gps_session = ClientSession(cookie_jar=jar)
-        jar.update_cookies(_gps_cookies, response_url=URL("https://web.planetgps.com"))
-
+    """Fetch mileage for the current month for a device from PlanetGPS."""
     now = datetime.now(timezone.utc)
     start = f"{now.year}-{now.month:02d}-01 00:00"
     end = f"{now.year}-{now.month:02d}-{now.day:02d} 23:59"
 
     payload = json.dumps({
-        "UserID": 272967,
+        "UserID": PLANET_GPS_USER_ID,
         "TimeZones": "5:00",
         "StartDates": start,
         "EndDates": end,
         "DeviceID": 0
     })
-    headers = {
-        "Content-Type": "application/json",
-        "Accept": "application/json, text/javascript, */*; q=0.01",
-        "Referer": "https://web.planetgps.com/Report/Report.aspx",
-        "Origin": "https://web.planetgps.com",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "X-Requested-With": "XMLHttpRequest",
-    }
+    data = await gps_post("/Ajax/ReportAjax.asmx/GetReportOverview", payload,
+                          referer=f"{PLANET_GPS_BASE}/Report/Report.aspx")
+    if not data or not data.get("d"):
+        return None
     try:
-        async with _gps_session.post(
-            "https://web.planetgps.com/Ajax/ReportAjax.asmx/GetReportOverview",
-            data=payload, headers=headers
-        ) as resp:
-            data = await resp.json(content_type=None)
-            if "d" not in data or not data["d"]:
-                return None
-            import re as _re
-            raw = data["d"]
-            fixed = _re.sub(r'([{,])\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*:', r'\1"\2":', raw)
-            fixed = _re.sub(r":\s*'([^']*)'", r':"\1"', fixed)
-            parsed = json.loads(fixed)
-            rows = parsed.get("reports") or parsed.get("reportList") or parsed.get("devices") or parsed.get("list") or []
-            if rows:
-                # Find row matching device_id by cross-referencing fleet data
-                # First try exact device id match
-                row = next((r for r in rows if str(r.get("deviceID") or r.get("DeviceID") or "") == str(device_id)), None)
-                # If not found, get fleet data to match by name
-                if not row:
-                    try:
-                        fleet_payload = '{"UserID":272967,"isFirst":true,"TimeZones":"5:00","DeviceID":0}'
-                        fleet_headers = {
-                            "Content-Type": "application/json",
-                            "Referer": "https://web.planetgps.com/Monitor.aspx",
-                            "Origin": "https://web.planetgps.com",
-                            "User-Agent": "Mozilla/5.0",
-                            "X-Requested-With": "XMLHttpRequest",
-                        }
-                        async with _gps_session.post(
-                            "https://web.planetgps.com/Ajax/DevicesAjax.asmx/GetDevicesByUserID",
-                            data=fleet_payload, headers=fleet_headers
-                        ) as fr:
-                            fdata = await fr.json(content_type=None)
-                            if fdata.get("d"):
-                                fraw = fdata["d"]
-                                ffixed = _re.sub(r'([{,])\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*:', r'\1"\2":', fraw)
-                                ffixed = _re.sub(r":\s*'([^']*)'", r':"\1"', ffixed)
-                                fdevices = json.loads(ffixed).get("devices", [])
-                                device = next((d for d in fdevices if str(d.get("id", "")) == str(device_id)), None)
-                                if device:
-                                    dname = device.get("name", "").lower()
-                                    row = next((r for r in rows if r.get("name", "").lower() == dname), None)
-                    except Exception as fe:
-                        print(f"Fleet lookup error: {fe}")
-                if not row:
-                    row = rows[0]
-                mileage = row.get("distance") or row.get("mileage") or row.get("Mileage") or "—"
-                # Always convert km to miles (API always returns km)
-                try:
-                    mileage = round(float(mileage) * 0.621371, 2)
-                except Exception:
-                    pass
-                return str(mileage)
-            return "0"
+        parsed = _parse_relaxed_json(data["d"])
     except Exception as e:
-        print(f"Mileage fetch error: {e}")
+        print(f"Mileage parse error: {e}")
+        return None
+
+    rows = parsed.get("reports") or parsed.get("reportList") or parsed.get("devices") or parsed.get("list") or []
+    if not rows:
+        return "0"
+
+    row = next((r for r in rows if str(r.get("deviceID") or r.get("DeviceID") or "") == str(device_id)), None)
+    if not row:
+        row = await _match_row_by_device_name(rows, device_id)
+    if not row:
+        row = rows[0]
+
+    mileage = row.get("distance") or row.get("mileage") or row.get("Mileage") or "—"
+    # PlanetGPS reports km; the app shows miles
+    try:
+        mileage = round(float(mileage) * 0.621371, 2)
+    except Exception:
+        pass
+    return str(mileage)
+
+
+async def _match_row_by_device_name(rows: list, device_id: str):
+    """Report rows may lack device ids; match through the fleet list by name."""
+    try:
+        data = await gps_post("/Ajax/DevicesAjax.asmx/GetDevicesByUserID", FLEET_PAYLOAD,
+                              referer=f"{PLANET_GPS_BASE}/Monitor.aspx")
+        if not data or not data.get("d"):
+            return None
+        devices = _parse_relaxed_json(data["d"]).get("devices", [])
+        device = next((d for d in devices if str(d.get("id", "")) == str(device_id)), None)
+        if not device:
+            return None
+        dname = device.get("name", "").lower()
+        return next((r for r in rows if r.get("name", "").lower() == dname), None)
+    except Exception as e:
+        print(f"Fleet lookup error: {e}")
         return None
 
 # ================== ROUTES ==================
@@ -195,13 +382,16 @@ async def handle_drivers(request: web.Request):
     if not is_admin_request(request):
         return web.json_response({"error": "Forbidden"}, status=403)
     drivers = load_drivers()
+    items = list(drivers.items())
+    file_lists = await asyncio.gather(*(
+        asyncio.to_thread(list_driver_files, get_driver_folder(uid, d.get("name", "")))
+        for uid, d in items
+    ))
     result = []
-    for uid, d in drivers.items():
-        folder = get_driver_folder(uid, d["name"])
-        files = list_driver_files(folder)
+    for (uid, d), files in zip(items, file_lists):
         result.append({
             "id": uid,
-            "name": d["name"],
+            "name": d.get("name", ""),
             "car_model": d.get("car_model", ""),
             "car_number": d.get("car_number", ""),
             "tariff": d.get("tariff", ""),
@@ -219,12 +409,12 @@ async def handle_driver_get(request: web.Request):
     if driver_id not in drivers:
         return web.json_response({"error": "Driver not found"}, status=404)
     driver = drivers[driver_id]
-    folder = get_driver_folder(driver_id, driver["name"])
-    files = list_driver_files(folder)
+    folder = get_driver_folder(driver_id, driver.get("name", ""))
+    files = await asyncio.to_thread(list_driver_files, folder)
     return web.json_response({
         "driver": {
             "id": driver_id,
-            "name": driver["name"],
+            "name": driver.get("name", ""),
             "car_model": driver.get("car_model", ""),
             "car_number": driver.get("car_number", ""),
             "tariff": driver.get("tariff", ""),
@@ -244,7 +434,7 @@ async def handle_driver_add(request: web.Request):
         car_model = body.get("car_model", "").strip()
         car_number = body.get("car_number", "").strip()
         tariff = body.get("tariff", "").strip()
-        planet_gps_device_id = body.get("planet_gps_device_id", "").strip()
+        planet_gps_device_id = str(body.get("planet_gps_device_id", "")).strip()
         if not all([driver_id, name, car_model, car_number, tariff]):
             return web.json_response({"error": "All fields required"}, status=400)
         if not driver_id.isdigit():
@@ -285,6 +475,14 @@ async def handle_driver_update(request: web.Request):
         return web.json_response({"error": str(e)}, status=500)
 
 
+def _delete_driver_assets(folder: str):
+    cloudinary.api.delete_resources_by_prefix(folder + "/")
+    try:
+        cloudinary.api.delete_folder(folder)
+    except Exception:
+        pass
+
+
 async def handle_driver_delete(request: web.Request):
     if not is_admin_request(request):
         return web.json_response({"error": "Forbidden"}, status=403)
@@ -293,13 +491,9 @@ async def handle_driver_delete(request: web.Request):
     if driver_id not in drivers:
         return web.json_response({"error": "Driver not found"}, status=404)
     driver = drivers[driver_id]
-    folder = get_driver_folder(driver_id, driver["name"])
+    folder = get_driver_folder(driver_id, driver.get("name", ""))
     try:
-        cloudinary.api.delete_resources_by_prefix(folder + "/")
-        try:
-            cloudinary.api.delete_folder(folder)
-        except Exception:
-            pass
+        await asyncio.to_thread(_delete_driver_assets, folder)
     except Exception as e:
         print(f"Warn: couldn't delete Cloudinary resources: {e}")
     del drivers[driver_id]
@@ -315,7 +509,7 @@ async def handle_upload(request: web.Request):
     if driver_id not in drivers:
         return web.json_response({"error": "Driver not found"}, status=404)
     driver = drivers[driver_id]
-    folder = get_driver_folder(driver_id, driver["name"])
+    folder = get_driver_folder(driver_id, driver.get("name", ""))
     try:
         body = await request.json()
         image_b64 = body.get("image")
@@ -327,7 +521,10 @@ async def handle_upload(request: web.Request):
         image_bytes = base64.b64decode(image_b64)
         timestamp = int(time.time())
         filename = f"{doc_name}_{timestamp}"
-        result = cloudinary.uploader.upload(image_bytes, folder=folder, public_id=filename, resource_type="image")
+        result = await asyncio.to_thread(
+            cloudinary.uploader.upload, image_bytes,
+            folder=folder, public_id=filename, resource_type="image"
+        )
         return web.json_response({"success": True, "name": filename, "url": result["secure_url"], "public_id": result["public_id"]})
     except Exception as e:
         return web.json_response({"error": str(e)}, status=500)
@@ -341,7 +538,7 @@ async def handle_file_delete(request: web.Request):
         public_id = body.get("public_id", "").strip()
         if not public_id:
             return web.json_response({"error": "public_id required"}, status=400)
-        cloudinary.uploader.destroy(public_id, resource_type="image")
+        await asyncio.to_thread(cloudinary.uploader.destroy, public_id, resource_type="image")
         return web.json_response({"success": True})
     except Exception as e:
         return web.json_response({"error": str(e)}, status=500)
@@ -365,8 +562,8 @@ async def handle_driver_me(request: web.Request):
         return web.json_response({"error": "Not registered"}, status=403)
 
     driver = drivers[user_id]
-    folder = get_driver_folder(user_id, driver["name"])
-    files = list_driver_files(folder)
+    folder = get_driver_folder(user_id, driver.get("name", ""))
+    files = await asyncio.to_thread(list_driver_files, folder)
 
     # Fetch mileage if device_id is set
     mileage = None
@@ -380,7 +577,7 @@ async def handle_driver_me(request: web.Request):
     return web.json_response({
         "driver": {
             "id": user_id,
-            "name": driver["name"],
+            "name": driver.get("name", ""),
             "car_model": driver.get("car_model", ""),
             "car_number": driver.get("car_number", ""),
             "tariff": driver.get("tariff", ""),
@@ -397,7 +594,11 @@ async def handle_driver_me(request: web.Request):
 # ================== MILEAGE ENDPOINT ==================
 
 async def handle_mileage(request: web.Request):
-    """GET /api/mileage/{device_id} — monthly mileage for a specific device."""
+    """GET /api/mileage/{device_id} — monthly mileage for a specific device.
+
+    Intentionally unauthenticated to preserve the original public contract.
+    (To lock it down, add: `if not get_user_from_request(request): return 401`.)
+    """
     device_id = request.match_info["device_id"]
     if not device_id:
         return web.json_response({"mileage": None})
@@ -406,93 +607,16 @@ async def handle_mileage(request: web.Request):
 
 
 # ================== FLEET ==================
-from playwright.async_api import async_playwright
-
-PLANET_GPS_EMAIL = os.getenv("PLANET_GPS_EMAIL", "alexyss.waterry@icloud.com")
-PLANET_GPS_PASSWORD = os.getenv("PLANET_GPS_PASSWORD", "")
-PLANET_GPS_USER_ID = "272967"
-
-_gps_session = None
-_gps_cookies = None
-_playwright = None
-_browser = None
-
-async def planet_gps_login_playwright() -> bool:
-    global _playwright, _browser, _gps_cookies, _gps_session
-    try:
-        print("Starting Playwright login...")
-        _playwright = await async_playwright().start()
-        _browser = await _playwright.chromium.launch(headless=True)
-        context = await _browser.new_context()
-        page = await context.new_page()
-
-        await page.goto("https://web.planetgps.com/index.aspx", wait_until="domcontentloaded")
-        await page.wait_for_timeout(2000)
-        
-        frame = page.frame_locator("iframe#ifm")
-        await frame.locator("#changBar0").click()
-        await page.wait_for_timeout(500)
-        await frame.locator('input[name="txtUserName"]').fill(PLANET_GPS_EMAIL)
-        await frame.locator('input[name="txtAccountPassword"]').fill(PLANET_GPS_PASSWORD)
-        
-        async with page.expect_navigation(wait_until="domcontentloaded", timeout=15000):
-            await frame.locator('input[name="btnLogin"]').click()
-
-        final_url = page.url
-        print(f"Playwright final URL: {final_url}")
-
-        cookies = await context.cookies()
-        _gps_cookies = {c["name"]: c["value"] for c in cookies}
-        print(f"Got cookies: {list(_gps_cookies.keys())}")
-
-        await context.close()
-        return "Monitor.aspx" in final_url or "p=" in final_url
-
-    except Exception as e:
-        print(f"Playwright login error: {e}")
-        return False
-
 
 async def handle_fleet(request: web.Request):
     if not is_admin_request(request):
         return web.json_response({"error": "Forbidden"}, status=403)
-
-    global _gps_session, _gps_cookies
-    if not _gps_cookies:
-        ok = await planet_gps_login_playwright()
-        if not ok:
-            return web.json_response({"error": "PlanetGPS login failed"}, status=502)
-
-    if not _gps_session:
-        jar = CookieJar(unsafe=True)
-        _gps_session = ClientSession(cookie_jar=jar)
-        jar.update_cookies(_gps_cookies, response_url=URL("https://web.planetgps.com"))
-
-    payload = '{"UserID":272967,"isFirst":true,"TimeZones":"5:00","DeviceID":0}'
-    headers = {
-        "Content-Type": "application/json",
-        "Accept": "application/json, text/javascript, */*; q=0.01",
-        "Referer": "https://web.planetgps.com/Monitor.aspx",
-        "Origin": "https://web.planetgps.com",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "X-Requested-With": "XMLHttpRequest",
-    }
-    try:
-        async with _gps_session.post(
-            "https://web.planetgps.com/Ajax/DevicesAjax.asmx/GetDevicesByUserID",
-            data=payload, headers=headers
-        ) as resp:
-            data = await resp.json(content_type=None)
-            print(f"Fleet response: {str(data)[:200]}")
-            if "d" not in data or not data["d"]:
-                _gps_cookies = None
-                _gps_session = None
-                return web.json_response({"error": "Session expired"}, status=503)
-            return web.json_response(data)
-    except Exception as e:
-        _gps_cookies = None
-        _gps_session = None
-        return web.json_response({"error": str(e)}, status=500)
+    data = await gps_post("/Ajax/DevicesAjax.asmx/GetDevicesByUserID", FLEET_PAYLOAD,
+                          referer=f"{PLANET_GPS_BASE}/Monitor.aspx")
+    print(f"Fleet response: {str(data)[:200]}")
+    if not data or not data.get("d"):
+        return web.json_response({"error": "PlanetGPS unavailable"}, status=502)
+    return web.json_response(data)
 
 
 async def handle_fleet_report(request: web.Request):
@@ -505,38 +629,83 @@ async def handle_fleet_report(request: web.Request):
     if not start or not end:
         return web.json_response({"error": "Missing from/to"}, status=400)
 
-    global _gps_session, _gps_cookies
-    if not _gps_cookies:
-        ok = await planet_gps_login_playwright()
-        if not ok:
-            return web.json_response({"error": "PlanetGPS login failed"}, status=502)
-        jar = CookieJar(unsafe=True)
-        _gps_session = ClientSession(cookie_jar=jar)
-        jar.update_cookies(_gps_cookies, response_url=URL("https://web.planetgps.com"))
+    payload = json.dumps({
+        "UserID": PLANET_GPS_USER_ID,
+        "TimeZones": "5:00",
+        "StartDates": start,
+        "EndDates": end,
+        "DeviceID": 0
+    })
+    data = await gps_post("/Ajax/ReportAjax.asmx/GetReportOverview", payload,
+                          referer=f"{PLANET_GPS_BASE}/Report/Report.aspx?id={PLANET_GPS_USER_ID}&deviceid=0&randon=21896")
+    print(f"Report response: {str(data)[:300]}")
+    if not data:
+        return web.json_response({"error": "PlanetGPS unavailable"}, status=502)
+    return web.json_response(data)
 
-    payload = f'{{"UserID":272967,"TimeZones":"5:00","StartDates":"{start}","EndDates":"{end}","DeviceID":0}}'
-    headers = {
-        "Content-Type": "application/json",
-        "Accept": "application/json, text/javascript, */*; q=0.01",
-        "Referer": "https://web.planetgps.com/Report/Report.aspx?id=272967&deviceid=0&randon=21896",
-        "Origin": "https://web.planetgps.com",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "X-Requested-With": "XMLHttpRequest",
-    }
+
+async def _fetch_report_page(report_url: str, headers: dict) -> str | None:
+    """GET the report page HTML, re-logging in once if the session is dead."""
+    for attempt in range(2):
+        sess = await ensure_gps_session()
+        if sess is None:
+            return None
+        try:
+            async with sess.get(report_url, headers=headers,
+                                 timeout=GPS_REPORT_TIMEOUT) as resp:
+                html = await resp.text()
+            if 'id="__VIEWSTATE"' in html:
+                return html
+            print(f"Report page has no viewstate (attempt {attempt + 1})")
+        except Exception as e:
+            print(f"Report page fetch error (attempt {attempt + 1}): {e}")
+        await _invalidate_gps_session(sess)
+    return None
+
+
+def _convert_report_to_miles(content: bytes, start: str, end: str) -> tuple[bytes, str, str]:
+    """Convert the km mileage column of the exported report to miles."""
     try:
-        async with _gps_session.post(
-            "https://web.planetgps.com/Ajax/ReportAjax.asmx/GetReportOverview",
-            data=payload, headers=headers
-        ) as resp:
-            data = await resp.json(content_type=None)
-            print(f"Report response: {str(data)[:300]}")
-            if "d" not in data:
-                _gps_cookies = None
-                _gps_session = None
-                return web.json_response({"error": "Session expired"}, status=503)
-            return web.json_response(data)
+        wb = openpyxl.load_workbook(io.BytesIO(content))
+        for ws in wb.worksheets:
+            header_row = None
+            mileage_col = None
+            for row in ws.iter_rows():
+                for cell in row:
+                    if cell.value and isinstance(cell.value, str):
+                        v = cell.value.strip().lower()
+                        if v in ('mileage', 'distance', 'пробег', 'miles'):
+                            mileage_col = cell.column
+                            header_row = cell.row
+                if header_row:
+                    break
+
+            if mileage_col and header_row:
+                for row in ws.iter_rows(min_row=header_row + 1):
+                    for cell in row:
+                        if cell.column == mileage_col and cell.value is not None:
+                            try:
+                                cell.value = round(float(cell.value) * 0.621371, 2)
+                            except Exception:
+                                pass
+                header_cell = ws.cell(row=header_row, column=mileage_col)
+                if header_cell.value:
+                    header_cell.value = "Mileage (mi)"
+
+        out = io.BytesIO()
+        wb.save(out)
+        return (
+            out.getvalue(),
+            f"report_{start[:10]}_{end[:10]}_miles.xlsx",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
     except Exception as e:
-        return web.json_response({"error": str(e)}, status=500)
+        print(f"Excel conversion error: {e}")
+        return (
+            content,
+            f"report_{start[:10]}_{end[:10]}.xls",
+            "application/vnd.ms-excel",
+        )
 
 
 async def handle_fleet_report_excel(request: web.Request):
@@ -549,27 +718,21 @@ async def handle_fleet_report_excel(request: web.Request):
     if not start or not end:
         return web.json_response({"error": "Missing from/to"}, status=400)
 
-    global _gps_session, _gps_cookies
-    if not _gps_cookies:
-        ok = await planet_gps_login_playwright()
-        if not ok:
-            return web.json_response({"error": "Login failed"}, status=502)
-        jar = CookieJar(unsafe=True)
-        _gps_session = ClientSession(cookie_jar=jar)
-        jar.update_cookies(_gps_cookies, response_url=URL("https://web.planetgps.com"))
-
-    report_url = f"https://web.planetgps.com/Report/Report.aspx?id={PLANET_GPS_USER_ID}&deviceid=0&randon=12345"
+    report_url = f"{PLANET_GPS_BASE}/Report/Report.aspx?id={PLANET_GPS_USER_ID}&deviceid=0&randon=12345"
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
         "Referer": report_url,
     }
-    import re as _re
-    async with _gps_session.get(report_url, headers=headers) as resp:
-        html = await resp.text()
+    html = await _fetch_report_page(report_url, headers)
+    if html is None:
+        return web.json_response({"error": "PlanetGPS unavailable"}, status=502)
+    sess = _gps_session
+    if sess is None or sess.closed:
+        return web.json_response({"error": "PlanetGPS unavailable"}, status=502)
 
     fields = {}
     for field in ["__VIEWSTATE", "__VIEWSTATEGENERATOR", "__EVENTVALIDATION"]:
-        m = _re.search(rf'id="{field}"[^>]*value="([^"]*)"', html)
+        m = re.search(rf'id="{field}"[^>]*value="([^"]*)"', html)
         fields[field] = m.group(1) if m else ""
 
     data = {
@@ -577,74 +740,23 @@ async def handle_fleet_report_excel(request: web.Request):
         "beginTime": start,
         "endTime": end,
         "btnToExcel": "To Excel",
-        "hidUserID": PLANET_GPS_USER_ID,
+        "hidUserID": str(PLANET_GPS_USER_ID),
         "hidTimeZone": "5:00",
         "hidDeviceID": "0",
     }
-
     post_headers = {
         **headers,
         "Content-Type": "application/x-www-form-urlencoded",
     }
 
     try:
-        async with _gps_session.post(report_url, data=data, headers=post_headers) as resp:
+        async with sess.post(report_url, data=data, headers=post_headers,
+                             timeout=GPS_REPORT_TIMEOUT) as resp:
             content = await resp.read()
 
-        # Convert km to miles using openpyxl
-        try:
-            import io
-            import openpyxl
-            wb = openpyxl.load_workbook(io.BytesIO(content))
-            for ws in wb.worksheets:
-                # Find header row to locate mileage column
-                header_row = None
-                mileage_col = None
-                iskm_col = None
-                for row in ws.iter_rows():
-                    for cell in row:
-                        if cell.value and isinstance(cell.value, str):
-                            v = cell.value.strip().lower()
-                            if v in ('mileage', 'distance', 'пробег', 'miles'):
-                                mileage_col = cell.column
-                                header_row = cell.row
-                            if v == 'iskm':
-                                iskm_col = cell.column
-                    if header_row:
-                        break
-
-                if mileage_col and header_row:
-                    for row in ws.iter_rows(min_row=header_row + 1):
-                        mileage_cell = None
-                        iskm_val = "1"  # default: assume km
-                        for cell in row:
-                            if cell.column == mileage_col:
-                                mileage_cell = cell
-                            if iskm_col and cell.column == iskm_col:
-                                iskm_val = str(cell.value or "1")
-                        if mileage_cell and mileage_cell.value is not None:
-                            try:
-                                # Always convert km to miles
-                                mileage_cell.value = round(float(mileage_cell.value) * 0.621371, 2)
-                            except Exception:
-                                pass
-
-                # Also rename header
-                if mileage_col and header_row:
-                    cell = ws.cell(row=header_row, column=mileage_col)
-                    if cell.value:
-                        cell.value = "Mileage (mi)"
-
-            out = io.BytesIO()
-            wb.save(out)
-            content = out.getvalue()
-            filename = f"report_{start[:10]}_{end[:10]}_miles.xlsx"
-            content_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        except Exception as e:
-            print(f"Excel conversion error: {e}")
-            filename = f"report_{start[:10]}_{end[:10]}.xls"
-            content_type = "application/vnd.ms-excel"
-
+        content, filename, content_type = await asyncio.to_thread(
+            _convert_report_to_miles, content, start, end
+        )
         return web.Response(
             body=content,
             content_type=content_type,
@@ -660,7 +772,10 @@ async def cors_middleware(request, handler):
     if request.method == "OPTIONS":
         response = web.Response()
     else:
-        response = await handler(request)
+        try:
+            response = await handler(request)
+        except web.HTTPException as ex:
+            response = ex
     response.headers["Access-Control-Allow-Origin"] = "*"
     response.headers["Access-Control-Allow-Headers"] = "Content-Type, X-Telegram-Init-Data"
     response.headers["Access-Control-Allow-Methods"] = "GET, POST, PATCH, DELETE, OPTIONS"
@@ -672,9 +787,9 @@ def create_app() -> web.Application:
     app.router.add_get("/me", handle_me)
     app.router.add_get("/drivers", handle_drivers)
     app.router.add_post("/drivers", handle_driver_add)
-    app.router.add_get("/driver/me", handle_driver_me)          # NEW: driver self-view
+    app.router.add_get("/driver/me", handle_driver_me)
     app.router.add_get("/driver/{id}", handle_driver_get)
-    app.router.add_patch("/driver/{id}", handle_driver_update)  # NEW: update device_id
+    app.router.add_patch("/driver/{id}", handle_driver_update)
     app.router.add_delete("/driver/{id}", handle_driver_delete)
     app.router.add_post("/driver/{id}/upload", handle_upload)
     app.router.add_delete("/file", handle_file_delete)
@@ -693,27 +808,47 @@ def create_app() -> web.Application:
     return app
 
 
+async def _gps_ping() -> bool:
+    """Cheap HTTP request that both checks and extends the server-side session."""
+    sess = _gps_session
+    if not _gps_cookies or sess is None or sess.closed:
+        return False
+    try:
+        headers = {**GPS_BASE_HEADERS, "Referer": f"{PLANET_GPS_BASE}/Monitor.aspx"}
+        async with sess.post(f"{PLANET_GPS_BASE}/Ajax/DevicesAjax.asmx/GetDevicesByUserID",
+                             data=FLEET_PAYLOAD, headers=headers) as resp:
+            data = await resp.json(content_type=None)
+        return isinstance(data, dict) and bool(data.get("d"))
+    except Exception as e:
+        print(f"GPS ping error: {e}")
+        return False
+
+
 async def keep_gps_session_alive():
-    """Background task: re-login to PlanetGPS every 6 hours."""
-    global _gps_cookies, _gps_session
-    # Initial login at startup
+    """Keep the PlanetGPS session warm with cheap HTTP pings; only do a full
+    browser login when the session is actually gone. (The old version
+    launched a fresh browser every cycle and never closed the previous one —
+    the leaked processes eventually exhausted the container's threads and
+    every subsequent launch failed.)
+    """
+    global _next_login_allowed
     await asyncio.sleep(30)
     while True:
         try:
-            print("Background GPS session refresh...")
-            ok = await planet_gps_login_playwright()
-            if ok:
-                if _gps_session:
-                    await _gps_session.close()
-                jar = CookieJar(unsafe=True)
-                _gps_session = ClientSession(cookie_jar=jar)
-                jar.update_cookies(_gps_cookies, response_url=URL("https://web.planetgps.com"))
-                print("GPS session refreshed OK")
-            else:
-                print("GPS session refresh FAILED")
+            if not await _gps_ping():
+                print("Background GPS session refresh...")
+                # The keepalive cadence itself rate-limits logins, so clear the
+                # request-driven backoff here: a transient failure must never
+                # leave the session frozen until the (up to 30-min) backoff ends.
+                _next_login_allowed = 0.0
+                await _invalidate_gps_session()
+                if await ensure_gps_session():
+                    print("GPS session refreshed OK")
+                else:
+                    print("GPS session refresh FAILED")
         except Exception as e:
             print(f"GPS keepalive error: {e}")
-        await asyncio.sleep(6 * 900)
+        await asyncio.sleep(GPS_PING_INTERVAL)
 
 
 async def start_server():
@@ -724,8 +859,13 @@ async def start_server():
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
     print(f"API server running on port {port}")
-    asyncio.create_task(keep_gps_session_alive())
-    await asyncio.Event().wait()
+    keepalive = asyncio.create_task(keep_gps_session_alive())
+    try:
+        await asyncio.Event().wait()
+    finally:
+        keepalive.cancel()
+        await _close_gps_session()
+        await runner.cleanup()
 
 if __name__ == "__main__":
     asyncio.run(start_server())
