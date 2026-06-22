@@ -616,6 +616,47 @@ async def handle_driver_me(request: web.Request):
     })
 
 
+async def handle_driver_me_upload(request: web.Request):
+    """Driver uploads a document into their OWN Cloudinary folder.
+
+    Auth: any valid Telegram user whose ID exists in drivers.json (same as
+    /driver/me). This is the self-service counterpart to the admin-only
+    /driver/{id}/upload — a driver may add files to their own folder but to
+    no one else's.
+    """
+    user = get_user_from_request(request)
+    if not user:
+        return web.json_response({"error": "Unauthorized"}, status=401)
+    user_id = str(user.get("id", ""))
+    drivers = load_drivers()
+    if user_id not in drivers:
+        return web.json_response({"error": "Not registered"}, status=403)
+    driver = drivers[user_id]
+    folder = get_driver_folder(user_id, driver.get("name", ""))
+    try:
+        body = await request.json()
+        image_b64 = body.get("image")
+        doc_name = (body.get("name", "document") or "document").strip().replace(" ", "_") or "document"
+        if not image_b64:
+            return web.json_response({"error": "No image provided"}, status=400)
+        if "," in image_b64:
+            image_b64 = image_b64.split(",", 1)[1]
+        image_bytes = base64.b64decode(image_b64)
+        filename = f"{doc_name}_{int(time.time())}"
+        result = await asyncio.to_thread(
+            cloudinary.uploader.upload, image_bytes,
+            folder=folder, public_id=filename, resource_type="image"
+        )
+        return web.json_response({
+            "success": True,
+            "name": filename,
+            "url": result["secure_url"],
+            "public_id": result["public_id"],
+        })
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=500)
+
+
 # ================== MILEAGE ENDPOINT ==================
 
 async def handle_mileage(request: web.Request):
@@ -813,6 +854,7 @@ def create_app() -> web.Application:
     app.router.add_get("/drivers", handle_drivers)
     app.router.add_post("/drivers", handle_driver_add)
     app.router.add_get("/driver/me", handle_driver_me)
+    app.router.add_post("/driver/me/upload", handle_driver_me_upload)
     app.router.add_get("/driver/{id}", handle_driver_get)
     app.router.add_patch("/driver/{id}", handle_driver_update)
     app.router.add_delete("/driver/{id}", handle_driver_delete)
@@ -823,7 +865,7 @@ def create_app() -> web.Application:
     app.router.add_get("/api/fleet/report", handle_fleet_report)
     app.router.add_get("/api/fleet/report/excel", handle_fleet_report_excel)
     options_paths = [
-        "/me", "/drivers", "/driver/me", "/driver/{id}",
+        "/me", "/drivers", "/driver/me", "/driver/me/upload", "/driver/{id}",
         "/driver/{id}/upload", "/file", "/api/fleet",
         "/api/mileage/{device_id}",
         "/api/fleet/report", "/api/fleet/report/excel"
