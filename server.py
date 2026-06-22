@@ -396,12 +396,19 @@ async def handle_drivers(request: web.Request):
             "car_number": d.get("car_number", ""),
             "tariff": d.get("tariff", ""),
             "planet_gps_device_id": d.get("planet_gps_device_id", ""),
+            "monthly_mileage_limit": d.get("monthly_mileage_limit", ""),
             "file_count": len(files),
         })
     return web.json_response(result)
 
 
 async def handle_driver_get(request: web.Request):
+    """Admin view of one driver: profile + documents + this month's mileage.
+
+    Returns the same shape the driver sees in their own profile (driver +
+    files + mileage), so the admin panel can render the driver's profile
+    'as the driver sees it' while staying authenticated as the admin.
+    """
     if not is_admin_request(request):
         return web.json_response({"error": "Forbidden"}, status=403)
     driver_id = request.match_info["id"]
@@ -411,6 +418,12 @@ async def handle_driver_get(request: web.Request):
     driver = drivers[driver_id]
     folder = get_driver_folder(driver_id, driver.get("name", ""))
     files = await asyncio.to_thread(list_driver_files, folder)
+
+    # Live mileage for the current month (same source the driver self-view uses)
+    device_id = driver.get("planet_gps_device_id", "")
+    mileage_value = await get_monthly_mileage(device_id) if device_id else None
+    now = datetime.now(timezone.utc)
+
     return web.json_response({
         "driver": {
             "id": driver_id,
@@ -419,8 +432,15 @@ async def handle_driver_get(request: web.Request):
             "car_number": driver.get("car_number", ""),
             "tariff": driver.get("tariff", ""),
             "planet_gps_device_id": driver.get("planet_gps_device_id", ""),
+            "monthly_mileage_limit": driver.get("monthly_mileage_limit", ""),
         },
         "files": files,
+        "mileage": {
+            "value": mileage_value,
+            "limit": driver.get("monthly_mileage_limit", ""),
+            "month": now.strftime("%B %Y"),
+            "has_gps": bool(device_id),
+        },
     })
 
 
@@ -435,6 +455,7 @@ async def handle_driver_add(request: web.Request):
         car_number = body.get("car_number", "").strip()
         tariff = body.get("tariff", "").strip()
         planet_gps_device_id = str(body.get("planet_gps_device_id", "")).strip()
+        monthly_mileage_limit = str(body.get("monthly_mileage_limit", "")).strip()
         if not all([driver_id, name, car_model, car_number, tariff]):
             return web.json_response({"error": "All fields required"}, status=400)
         if not driver_id.isdigit():
@@ -448,6 +469,7 @@ async def handle_driver_add(request: web.Request):
             "car_number": car_number,
             "tariff": tariff,
             "planet_gps_device_id": planet_gps_device_id,
+            "monthly_mileage_limit": monthly_mileage_limit,
         }
         save_drivers(drivers)
         return web.json_response({"success": True, "id": driver_id})
@@ -456,7 +478,8 @@ async def handle_driver_add(request: web.Request):
 
 
 async def handle_driver_update(request: web.Request):
-    """Update driver fields (admin only). Used to set planet_gps_device_id on existing drivers."""
+    """Update driver fields (admin only). Used to set planet_gps_device_id and
+    the custom monthly mileage limit on existing drivers."""
     if not is_admin_request(request):
         return web.json_response({"error": "Forbidden"}, status=403)
     driver_id = request.match_info["id"]
@@ -465,7 +488,8 @@ async def handle_driver_update(request: web.Request):
         return web.json_response({"error": "Driver not found"}, status=404)
     try:
         body = await request.json()
-        updatable = ["car_model", "car_number", "tariff", "planet_gps_device_id"]
+        updatable = ["car_model", "car_number", "tariff",
+                     "planet_gps_device_id", "monthly_mileage_limit"]
         for field in updatable:
             if field in body:
                 drivers[driver_id][field] = str(body[field]).strip()
@@ -585,6 +609,7 @@ async def handle_driver_me(request: web.Request):
         "files": files,
         "mileage": {
             "value": mileage,
+            "limit": driver.get("monthly_mileage_limit", ""),
             "month": month_label,
             "has_gps": bool(device_id),
         }
