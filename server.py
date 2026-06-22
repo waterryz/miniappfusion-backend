@@ -15,7 +15,6 @@ from datetime import datetime, timezone
 import cloudinary
 import cloudinary.api
 import cloudinary.uploader
-import openpyxl
 from aiohttp import ClientSession, ClientTimeout, CookieJar, web
 from playwright.async_api import async_playwright
 from yarl import URL
@@ -24,6 +23,22 @@ from yarl import URL
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ALLOWED_ADMINS = {5348697217, 547004364}
 DATA_PATH = "/data/drivers.json"
+
+# Optional driver fields (beyond the required name/car_model/car_number/tariff).
+# Stored as trimmed strings; shared by add/update/get so the set stays in sync.
+# NOTE: "name" is intentionally NOT updatable — it is part of the Cloudinary
+# folder path (drivers/{id}_{name}); renaming would orphan stored documents.
+OPTIONAL_DRIVER_FIELDS = [
+    "car_year",
+    "car_trim",
+    "planet_gps_device_id",
+    "monthly_mileage_limit",
+    "weekly_price",
+    "dmv_inspection_date",
+    "payment_weekday",
+    "last_service_mileage",
+    "last_service_date",
+]
 
 PLANET_GPS_BASE = "https://web.planetgps.com"
 PLANET_GPS_EMAIL = os.getenv("PLANET_GPS_EMAIL", "alexyss.waterry@icloud.com")
@@ -429,10 +444,17 @@ async def handle_driver_get(request: web.Request):
             "id": driver_id,
             "name": driver.get("name", ""),
             "car_model": driver.get("car_model", ""),
+            "car_year": driver.get("car_year", ""),
+            "car_trim": driver.get("car_trim", ""),
             "car_number": driver.get("car_number", ""),
             "tariff": driver.get("tariff", ""),
             "planet_gps_device_id": driver.get("planet_gps_device_id", ""),
             "monthly_mileage_limit": driver.get("monthly_mileage_limit", ""),
+            "weekly_price": driver.get("weekly_price", ""),
+            "dmv_inspection_date": driver.get("dmv_inspection_date", ""),
+            "payment_weekday": driver.get("payment_weekday", ""),
+            "last_service_mileage": driver.get("last_service_mileage", ""),
+            "last_service_date": driver.get("last_service_date", ""),
         },
         "files": files,
         "mileage": {
@@ -454,23 +476,23 @@ async def handle_driver_add(request: web.Request):
         car_model = body.get("car_model", "").strip()
         car_number = body.get("car_number", "").strip()
         tariff = body.get("tariff", "").strip()
-        planet_gps_device_id = str(body.get("planet_gps_device_id", "")).strip()
-        monthly_mileage_limit = str(body.get("monthly_mileage_limit", "")).strip()
-        if not all([driver_id, name, car_model, car_number, tariff]):
-            return web.json_response({"error": "All fields required"}, status=400)
+        if not all([driver_id, name]):
+            return web.json_response({"error": "ID и имя обязательны"}, status=400)
         if not driver_id.isdigit():
             return web.json_response({"error": "ID must be numeric"}, status=400)
         drivers = load_drivers()
         if driver_id in drivers:
             return web.json_response({"error": "Driver with this ID already exists"}, status=409)
-        drivers[driver_id] = {
+        record = {
             "name": name,
             "car_model": car_model,
             "car_number": car_number,
             "tariff": tariff,
-            "planet_gps_device_id": planet_gps_device_id,
-            "monthly_mileage_limit": monthly_mileage_limit,
         }
+        # optional fields (stored as trimmed strings; empty if not provided)
+        for field in OPTIONAL_DRIVER_FIELDS:
+            record[field] = str(body.get(field, "")).strip()
+        drivers[driver_id] = record
         save_drivers(drivers)
         return web.json_response({"success": True, "id": driver_id})
     except Exception as e:
@@ -488,8 +510,7 @@ async def handle_driver_update(request: web.Request):
         return web.json_response({"error": "Driver not found"}, status=404)
     try:
         body = await request.json()
-        updatable = ["car_model", "car_number", "tariff",
-                     "planet_gps_device_id", "monthly_mileage_limit"]
+        updatable = ["car_model", "car_number", "tariff"] + OPTIONAL_DRIVER_FIELDS
         for field in updatable:
             if field in body:
                 drivers[driver_id][field] = str(body[field]).strip()
@@ -603,8 +624,15 @@ async def handle_driver_me(request: web.Request):
             "id": user_id,
             "name": driver.get("name", ""),
             "car_model": driver.get("car_model", ""),
+            "car_year": driver.get("car_year", ""),
+            "car_trim": driver.get("car_trim", ""),
             "car_number": driver.get("car_number", ""),
             "tariff": driver.get("tariff", ""),
+            "weekly_price": driver.get("weekly_price", ""),
+            "dmv_inspection_date": driver.get("dmv_inspection_date", ""),
+            "payment_weekday": driver.get("payment_weekday", ""),
+            "last_service_mileage": driver.get("last_service_mileage", ""),
+            "last_service_date": driver.get("last_service_date", ""),
         },
         "files": files,
         "mileage": {
@@ -730,8 +758,14 @@ async def _fetch_report_page(report_url: str, headers: dict) -> str | None:
 
 
 def _convert_report_to_miles(content: bytes, start: str, end: str) -> tuple[bytes, str, str]:
-    """Convert the km mileage column of the exported report to miles."""
+    """Convert the km mileage column of the exported report to miles.
+
+    openpyxl is imported lazily so a missing optional dependency can only
+    degrade this one feature (the report is returned unconverted) instead of
+    crashing the whole bot+API at startup.
+    """
     try:
+        import openpyxl
         wb = openpyxl.load_workbook(io.BytesIO(content))
         for ws in wb.worksheets:
             header_row = None
