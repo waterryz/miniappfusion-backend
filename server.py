@@ -353,13 +353,14 @@ async def get_monthly_mileage(device_id: str) -> str | None:
     if not row:
         row = rows[0]
 
-    mileage = row.get("distance") or row.get("mileage") or row.get("Mileage") or "—"
+    raw = row.get("distance") or row.get("mileage") or row.get("Mileage")
+    if raw in (None, "", "—"):
+        return None
     # PlanetGPS reports km; the app shows miles
     try:
-        mileage = round(float(mileage) * 0.621371, 2)
+        return str(round(float(raw) * 0.621371, 2))
     except Exception:
-        pass
-    return str(mileage)
+        return None
 
 
 async def _match_row_by_device_name(rows: list, device_id: str):
@@ -436,7 +437,9 @@ async def handle_driver_get(request: web.Request):
 
     # Live mileage for the current month (same source the driver self-view uses)
     device_id = driver.get("planet_gps_device_id", "")
-    mileage_value = await get_monthly_mileage(device_id) if device_id else None
+    # Месячный пробег подтягивается на клиенте с fleet-бэкенда (там рабочий GPS),
+    # поэтому здесь не блокируемся на медленном/ненадёжном скрейпинге.
+    mileage_value = None
     now = datetime.now(timezone.utc)
 
     return web.json_response({
@@ -610,11 +613,9 @@ async def handle_driver_me(request: web.Request):
     folder = get_driver_folder(user_id, driver.get("name", ""))
     files = await asyncio.to_thread(list_driver_files, folder)
 
-    # Fetch mileage if device_id is set
+    # Месячный пробег подтягивается на клиенте с fleet-бэкенда (рабочий GPS).
     mileage = None
     device_id = driver.get("planet_gps_device_id", "")
-    if device_id:
-        mileage = await get_monthly_mileage(device_id)
 
     now = datetime.now(timezone.utc)
     month_label = now.strftime("%B %Y")
@@ -629,6 +630,7 @@ async def handle_driver_me(request: web.Request):
             "car_number": driver.get("car_number", ""),
             "tariff": driver.get("tariff", ""),
             "weekly_price": driver.get("weekly_price", ""),
+            "planet_gps_device_id": device_id,
             "dmv_inspection_date": driver.get("dmv_inspection_date", ""),
             "payment_weekday": driver.get("payment_weekday", ""),
             "last_service_mileage": driver.get("last_service_mileage", ""),
