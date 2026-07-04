@@ -320,12 +320,13 @@ def _parse_relaxed_json(raw: str) -> dict:
     return json.loads(fixed)
 
 # ================== MILEAGE HELPER ==================
-async def get_monthly_mileage(device_id: str) -> str | None:
-    """Fetch mileage for the current month for a device from PlanetGPS."""
-    now = datetime.now(timezone.utc)
-    start = f"{now.year}-{now.month:02d}-01 00:00"
-    end = f"{now.year}-{now.month:02d}-{now.day:02d} 23:59"
+async def get_period_mileage(device_id: str, start: str, end: str) -> str | None:
+    """Fetch mileage (in miles) for a device over an arbitrary period.
 
+    start/end format: 'YYYY-MM-DD HH:MM'. Returns a string number (miles) or
+    None when GPS is unreachable / has no data. Shared by the monthly-mileage
+    endpoint and the service-mileage endpoint so both use the same logic.
+    """
     payload = json.dumps({
         "UserID": PLANET_GPS_USER_ID,
         "TimeZones": "5:00",
@@ -363,6 +364,14 @@ async def get_monthly_mileage(device_id: str) -> str | None:
         return None
 
 
+async def get_monthly_mileage(device_id: str) -> str | None:
+    """Fetch mileage for the current month for a device from PlanetGPS."""
+    now = datetime.now(timezone.utc)
+    start = f"{now.year}-{now.month:02d}-01 00:00"
+    end = f"{now.year}-{now.month:02d}-{now.day:02d} 23:59"
+    return await get_period_mileage(device_id, start, end)
+
+
 async def _match_row_by_device_name(rows: list, device_id: str):
     """Report rows may lack device ids; match through the fleet list by name."""
     try:
@@ -387,10 +396,19 @@ async def handle_me(request: web.Request):
     user = verify_telegram_init_data(init_data) if init_data else None
     if not user:
         return web.json_response({"error": "Unauthorized"}, status=401)
+
+    uid = user.get("id")
+    # Имя берём из drivers.json (настоящее ФИО), а не из Telegram-профиля,
+    # который может быть пустым/псевдонимом. На Telegram-имя откатываемся,
+    # только если водителя нет в базе.
+    driver = load_drivers().get(str(uid), {})
+    name = (driver.get("name") or "").strip() or user.get("first_name", "")
+
     return web.json_response({
-        "id": user.get("id"),
-        "name": user.get("first_name", ""),
-        "is_admin": user.get("id") in ALLOWED_ADMINS,
+        "id": uid,
+        "name": name,
+        "is_admin": uid in ALLOWED_ADMINS,
+        "is_driver": bool(driver),
     })
 
 
@@ -687,7 +705,7 @@ async def handle_driver_me_upload(request: web.Request):
         return web.json_response({"error": str(e)}, status=500)
 
 
-# ================== MILEAGE ENDPOINT ==================
+# ================== MILEAGE ENDPOINTS ==================
 
 async def handle_mileage(request: web.Request):
     """GET /api/mileage/{device_id} — monthly mileage for a specific device.
@@ -700,6 +718,27 @@ async def handle_mileage(request: web.Request):
         return web.json_response({"mileage": None})
     mileage = await get_monthly_mileage(device_id)
     return web.json_response({"mileage": mileage})
+
+
+async def handle_service_mileage(request: web.Request):
+    """GET /api/service-mileage/{device_id}?since=YYYY-MM-DD
+
+    Mileage (in miles) driven from the last service date up to now. Used by the
+    driver cabinet to compute "miles until next service" = 7000 − this value.
+    Returns {"mileage": <str|None>, "since": <start>}.
+    """
+    device_id = request.match_info["device_id"]
+    since = (request.rel_url.query.get("since", "") or "").strip()
+    if not device_id or not since:
+        return web.json_response({"mileage": None})
+    try:
+        d = datetime.strptime(since[:10], "%Y-%m-%d")
+    except ValueError:
+        return web.json_response({"mileage": None})
+    start = d.strftime("%Y-%m-%d 00:00")
+    end = datetime.now(timezone.utc).strftime("%Y-%m-%d 23:59")
+    mileage = await get_period_mileage(device_id, start, end)
+    return web.json_response({"mileage": mileage, "since": start})
 
 
 # ================== FLEET ==================
@@ -898,12 +937,14 @@ def create_app() -> web.Application:
     app.router.add_delete("/file", handle_file_delete)
     app.router.add_get("/api/fleet", handle_fleet)
     app.router.add_get("/api/mileage/{device_id}", handle_mileage)
+    app.router.add_get("/api/service-mileage/{device_id}", handle_service_mileage)
     app.router.add_get("/api/fleet/report", handle_fleet_report)
     app.router.add_get("/api/fleet/report/excel", handle_fleet_report_excel)
     options_paths = [
         "/me", "/drivers", "/driver/me", "/driver/me/upload", "/driver/{id}",
         "/driver/{id}/upload", "/file", "/api/fleet",
         "/api/mileage/{device_id}",
+        "/api/service-mileage/{device_id}",
         "/api/fleet/report", "/api/fleet/report/excel"
     ]
     for path in options_paths:
