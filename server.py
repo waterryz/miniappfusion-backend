@@ -10,7 +10,7 @@ import subprocess
 import sys
 import time
 import urllib.parse
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import cloudinary
 import cloudinary.api
@@ -320,12 +320,18 @@ def _parse_relaxed_json(raw: str) -> dict:
     return json.loads(fixed)
 
 # ================== MILEAGE HELPER ==================
-async def get_period_mileage(device_id: str, start: str, end: str) -> str | None:
-    """Fetch mileage (in miles) for a device over an arbitrary period.
+# PlanetGPS truncates report periods longer than ~1 month, so long ranges are
+# summed over ≤1-month windows.
+GPS_MAX_WINDOW_DAYS = 28
+GPS_MAX_WINDOWS = 24  # safety cap on the number of chunk requests (~up to ~2 years)
 
-    start/end format: 'YYYY-MM-DD HH:MM'. Returns a string number (miles) or
-    None when GPS is unreachable / has no data. Shared by the monthly-mileage
-    endpoint and the service-mileage endpoint so both use the same logic.
+
+async def _window_mileage_km(device_id: str, start: str, end: str) -> float | None:
+    """One PlanetGPS report call for a single window (≤ ~1 month).
+
+    Returns distance in KM (float); 0.0 when the window has no data; or None
+    when GPS is unreachable / unparseable, so the caller can decide to fail
+    rather than report an undercount. start/end format: 'YYYY-MM-DD HH:MM'.
     """
     payload = json.dumps({
         "UserID": PLANET_GPS_USER_ID,
@@ -346,7 +352,7 @@ async def get_period_mileage(device_id: str, start: str, end: str) -> str | None
 
     rows = parsed.get("reports") or parsed.get("reportList") or parsed.get("devices") or parsed.get("list") or []
     if not rows:
-        return "0"
+        return 0.0
 
     row = next((r for r in rows if str(r.get("deviceID") or r.get("DeviceID") or "") == str(device_id)), None)
     if not row:
@@ -356,12 +362,53 @@ async def get_period_mileage(device_id: str, start: str, end: str) -> str | None
 
     raw = row.get("distance") or row.get("mileage") or row.get("Mileage")
     if raw in (None, "", "—"):
+        return 0.0
+    try:
+        return float(raw)
+    except Exception:
+        return 0.0
+
+
+async def get_period_mileage(device_id: str, start: str, end: str) -> str | None:
+    """Mileage (in miles) for [start, end], summed over ≤1-month windows.
+
+    PlanetGPS caps report periods at about a month, so a range longer than that
+    (e.g. months since the last service) is split into GPS_MAX_WINDOW_DAYS-day
+    chunks and summed. Returns a string number (miles) or None when GPS is
+    unreachable. start/end format: 'YYYY-MM-DD HH:MM'.
+    """
+    try:
+        start_dt = datetime.strptime(start, "%Y-%m-%d %H:%M")
+        end_dt = datetime.strptime(end, "%Y-%m-%d %H:%M")
+    except ValueError:
+        return None
+    if end_dt <= start_dt:
+        return "0"
+
+    total_km = 0.0
+    got_any = False
+    cur = start_dt
+    windows = 0
+    step = timedelta(days=GPS_MAX_WINDOW_DAYS)
+    while cur < end_dt and windows < GPS_MAX_WINDOWS:
+        w_end = min(cur + step, end_dt)
+        km = await _window_mileage_km(
+            device_id,
+            cur.strftime("%Y-%m-%d %H:%M"),
+            w_end.strftime("%Y-%m-%d %H:%M"),
+        )
+        if km is None:
+            # GPS недоступен на этом окне — не отдаём заниженный итог.
+            return None
+        total_km += km
+        got_any = True
+        cur = w_end
+        windows += 1
+
+    if not got_any:
         return None
     # PlanetGPS reports km; the app shows miles
-    try:
-        return str(round(float(raw) * 0.621371, 2))
-    except Exception:
-        return None
+    return str(round(total_km * 0.621371, 2))
 
 
 async def get_monthly_mileage(device_id: str) -> str | None:
