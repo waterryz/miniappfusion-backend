@@ -390,6 +390,7 @@ async def get_period_mileage(device_id: str, start: str, end: str) -> str | None
     cur = start_dt
     windows = 0
     step = timedelta(days=GPS_MAX_WINDOW_DAYS)
+    print(f"[period_mileage] device={device_id} range {start} → {end}")
     while cur < end_dt and windows < GPS_MAX_WINDOWS:
         w_end = min(cur + step, end_dt)
         km = await _window_mileage_km(
@@ -397,8 +398,11 @@ async def get_period_mileage(device_id: str, start: str, end: str) -> str | None
             cur.strftime("%Y-%m-%d %H:%M"),
             w_end.strftime("%Y-%m-%d %H:%M"),
         )
+        print(f"[period_mileage]   window {cur:%Y-%m-%d} → {w_end:%Y-%m-%d}: "
+              f"{'None (GPS fail)' if km is None else f'{km:.2f} km ({km * 0.621371:.2f} mi)'}")
         if km is None:
             # GPS недоступен на этом окне — не отдаём заниженный итог.
+            print("[period_mileage]   → aborting: GPS unavailable on this window")
             return None
         total_km += km
         got_any = True
@@ -407,8 +411,10 @@ async def get_period_mileage(device_id: str, start: str, end: str) -> str | None
 
     if not got_any:
         return None
+    total_mi = round(total_km * 0.621371, 2)
+    print(f"[period_mileage] TOTAL {windows} windows = {total_km:.2f} km = {total_mi} mi")
     # PlanetGPS reports km; the app shows miles
-    return str(round(total_km * 0.621371, 2))
+    return str(total_mi)
 
 
 async def get_monthly_mileage(device_id: str) -> str | None:
