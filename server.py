@@ -11,19 +11,16 @@ import sys
 import time
 import urllib.parse
 from datetime import datetime, timedelta, timezone
-
 import cloudinary
 import cloudinary.api
 import cloudinary.uploader
 from aiohttp import ClientSession, ClientTimeout, CookieJar, web
 from playwright.async_api import async_playwright
 from yarl import URL
-
 # ================== CONFIG ==================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ALLOWED_ADMINS = {5348697217, 547004364}
 DATA_PATH = "/data/drivers.json"
-
 # Optional driver fields (beyond the required name/car_model/car_number/tariff).
 # Stored as trimmed strings; shared by add/update/get so the set stays in sync.
 # NOTE: "name" is intentionally NOT updatable — it is part of the Cloudinary
@@ -39,28 +36,23 @@ OPTIONAL_DRIVER_FIELDS = [
     "last_service_mileage",
     "last_service_date",
 ]
-
 PLANET_GPS_BASE = "https://web.planetgps.com"
 PLANET_GPS_EMAIL = os.getenv("PLANET_GPS_EMAIL", "alexyss.waterry@icloud.com")
 PLANET_GPS_PASSWORD = os.getenv("PLANET_GPS_PASSWORD", "")
 PLANET_GPS_USER_ID = 272967
-
 GPS_HTTP_TIMEOUT = ClientTimeout(total=30)
 GPS_REPORT_TIMEOUT = ClientTimeout(total=180)  # Excel export can take minutes to build
 GPS_PING_INTERVAL = 600          # keepalive ping every 10 min (ASP.NET sessions are sliding)
 GPS_LOGIN_MAX_BACKOFF = 1800     # cap on the delay between failed login attempts
-
 if not BOT_TOKEN:
     print("WARNING: BOT_TOKEN is not set — Telegram auth will reject everyone")
 if not PLANET_GPS_PASSWORD:
     print("WARNING: PLANET_GPS_PASSWORD is not set — GPS login will fail")
-
 cloudinary.config(
     cloud_name=os.getenv("CLOUDINARY_CLOUD_NAME"),
     api_key=os.getenv("CLOUDINARY_API_KEY"),
     api_secret=os.getenv("CLOUDINARY_API_SECRET")
 )
-
 # ================== AUTH ==================
 def verify_telegram_init_data(init_data: str) -> dict | None:
     try:
@@ -80,17 +72,14 @@ def verify_telegram_init_data(init_data: str) -> dict | None:
         return user
     except Exception:
         return None
-
 def get_user_from_request(request: web.Request) -> dict | None:
     init_data = request.headers.get("X-Telegram-Init-Data", "")
     if not init_data:
         return None
     return verify_telegram_init_data(init_data)
-
 def is_admin_request(request: web.Request) -> bool:
     user = get_user_from_request(request)
     return bool(user and user.get("id") in ALLOWED_ADMINS)
-
 # ================== HELPERS ==================
 def load_drivers() -> dict:
     if not os.path.exists(DATA_PATH):
@@ -101,18 +90,15 @@ def load_drivers() -> dict:
     except (OSError, json.JSONDecodeError) as e:
         print(f"drivers.json read error: {e}")
         return {}
-
 def save_drivers(data: dict):
     os.makedirs(os.path.dirname(DATA_PATH), exist_ok=True)
     tmp = DATA_PATH + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=4, ensure_ascii=False)
     os.replace(tmp, DATA_PATH)
-
 def get_driver_folder(driver_id: str, driver_name: str) -> str:
     name = driver_name.replace(" ", "_")
     return f"drivers/{driver_id}_{name}"
-
 def list_driver_files(folder: str) -> list[dict]:
     try:
         result = cloudinary.api.resources(type="upload", prefix=folder + "/", max_results=100)
@@ -129,18 +115,15 @@ def list_driver_files(folder: str) -> list[dict]:
         return files
     except Exception:
         return []
-
 # ================== PLANET GPS: SESSION CORE ==================
 _gps_session: ClientSession | None = None
 _gps_cookies: dict | None = None
 _gps_lock = asyncio.Lock()
 _login_fail_streak = 0
 _next_login_allowed = 0.0  # time.monotonic() deadline
-
 FLEET_PAYLOAD = json.dumps({
     "UserID": PLANET_GPS_USER_ID, "isFirst": True, "TimeZones": "5:00", "DeviceID": 0
 })
-
 GPS_BASE_HEADERS = {
     "Content-Type": "application/json",
     "Accept": "application/json, text/javascript, */*; q=0.01",
@@ -148,8 +131,6 @@ GPS_BASE_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
     "X-Requested-With": "XMLHttpRequest",
 }
-
-
 def _kill_stray_browsers():
     """Safety net: reap zombie headless-chrome processes from failed launches."""
     if not sys.platform.startswith("linux"):
@@ -159,11 +140,8 @@ def _kill_stray_browsers():
                        capture_output=True, timeout=10)
     except Exception:
         pass
-
-
 async def planet_gps_login_playwright() -> bool:
     """Log in via headless browser and stash the session cookies.
-
     The browser AND the playwright driver process are always closed, even on
     failure — leaking them exhausts the container's threads/PIDs and
     eventually makes every launch fail with pthread_create EAGAIN.
@@ -181,22 +159,17 @@ async def planet_gps_login_playwright() -> bool:
         )
         context = await browser.new_context()
         page = await context.new_page()
-
         await page.goto(f"{PLANET_GPS_BASE}/index.aspx", wait_until="domcontentloaded")
         await page.wait_for_timeout(2000)
-
         frame = page.frame_locator("iframe#ifm")
         await frame.locator("#changBar0").click()
         await page.wait_for_timeout(500)
         await frame.locator('input[name="txtUserName"]').fill(PLANET_GPS_EMAIL)
         await frame.locator('input[name="txtAccountPassword"]').fill(PLANET_GPS_PASSWORD)
-
         async with page.expect_navigation(wait_until="domcontentloaded", timeout=15000):
             await frame.locator('input[name="btnLogin"]').click()
-
         final_url = page.url
         print(f"Playwright final URL: {final_url}")
-
         cookies = await context.cookies()
         ok = "Monitor.aspx" in final_url or "p=" in final_url
         if ok:
@@ -217,8 +190,6 @@ async def planet_gps_login_playwright() -> bool:
                 await pw.stop()
         except Exception:
             pass
-
-
 async def _close_gps_session():
     global _gps_session
     sess, _gps_session = _gps_session, None
@@ -227,11 +198,8 @@ async def _close_gps_session():
             await sess.close()
         except Exception:
             pass
-
-
 async def _invalidate_gps_session(sess: ClientSession | None = None):
     """Drop the cached cookies/session so the next call re-logs in.
-
     When `sess` is given, only invalidate if it is still the live session — a
     concurrent caller may already have rebuilt it, and we must not stomp the
     fresh one. The stale session is closed either way.
@@ -246,8 +214,6 @@ async def _invalidate_gps_session(sess: ClientSession | None = None):
         return
     _gps_cookies = None
     await _close_gps_session()
-
-
 def _build_gps_session() -> ClientSession | None:
     cookies = _gps_cookies
     if not cookies:
@@ -256,11 +222,8 @@ def _build_gps_session() -> ClientSession | None:
     sess = ClientSession(cookie_jar=jar, timeout=GPS_HTTP_TIMEOUT)
     jar.update_cookies(cookies, response_url=URL(PLANET_GPS_BASE))
     return sess
-
-
 async def ensure_gps_session() -> ClientSession | None:
     """Return a logged-in ClientSession, re-logging in when needed.
-
     Single-flight: concurrent callers share one login attempt instead of each
     launching a browser. Failed logins back off exponentially so a flood of
     requests can't turn into a browser storm.
@@ -286,8 +249,6 @@ async def ensure_gps_session() -> ClientSession | None:
         await _close_gps_session()
         _gps_session = _build_gps_session()
         return _gps_session
-
-
 async def gps_post(path: str, payload: str, referer: str) -> dict | None:
     """POST to a PlanetGPS Ajax endpoint, re-logging in once if the session
     has expired. Returns the parsed JSON dict or None when GPS is unreachable.
@@ -311,24 +272,18 @@ async def gps_post(path: str, payload: str, referer: str) -> dict | None:
             print(f"GPS request error (attempt {attempt + 1}): {e}")
         await _invalidate_gps_session(sess)
     return None
-
-
 def _parse_relaxed_json(raw: str) -> dict:
     """PlanetGPS returns JS object literals (unquoted keys, single quotes)."""
     fixed = re.sub(r'([{,])\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*:', r'\1"\2":', raw)
     fixed = re.sub(r":\s*'([^']*)'", r':"\1"', fixed)
     return json.loads(fixed)
-
 # ================== MILEAGE HELPER ==================
 # PlanetGPS truncates report periods longer than ~1 month, so long ranges are
 # summed over ≤1-month windows.
 GPS_MAX_WINDOW_DAYS = 28
 GPS_MAX_WINDOWS = 24  # safety cap on the number of chunk requests (~up to ~2 years)
-
-
 async def _window_mileage_km(device_id: str, start: str, end: str) -> float | None:
     """One PlanetGPS report call for a single window (≤ ~1 month).
-
     Returns distance in KM (float); 0.0 when the window has no data; or None
     when GPS is unreachable / unparseable, so the caller can decide to fail
     rather than report an undercount. start/end format: 'YYYY-MM-DD HH:MM'.
@@ -349,17 +304,14 @@ async def _window_mileage_km(device_id: str, start: str, end: str) -> float | No
     except Exception as e:
         print(f"Mileage parse error: {e}")
         return None
-
     rows = parsed.get("reports") or parsed.get("reportList") or parsed.get("devices") or parsed.get("list") or []
     if not rows:
         return 0.0
-
     row = next((r for r in rows if str(r.get("deviceID") or r.get("DeviceID") or "") == str(device_id)), None)
     if not row:
         row = await _match_row_by_device_name(rows, device_id)
     if not row:
         row = rows[0]
-
     raw = row.get("distance") or row.get("mileage") or row.get("Mileage")
     if raw in (None, "", "—"):
         return 0.0
@@ -367,11 +319,8 @@ async def _window_mileage_km(device_id: str, start: str, end: str) -> float | No
         return float(raw)
     except Exception:
         return 0.0
-
-
 async def get_period_mileage(device_id: str, start: str, end: str) -> str | None:
     """Mileage (in miles) for [start, end], summed over ≤1-month windows.
-
     PlanetGPS caps report periods at about a month, so a range longer than that
     (e.g. months since the last service) is split into GPS_MAX_WINDOW_DAYS-day
     chunks and summed. Returns a string number (miles) or None when GPS is
@@ -384,7 +333,6 @@ async def get_period_mileage(device_id: str, start: str, end: str) -> str | None
         return None
     if end_dt <= start_dt:
         return "0"
-
     total_km = 0.0
     got_any = False
     cur = start_dt
@@ -404,21 +352,31 @@ async def get_period_mileage(device_id: str, start: str, end: str) -> str | None
         got_any = True
         cur = w_end
         windows += 1
-
     if not got_any:
         return None
     # PlanetGPS reports km; the app shows miles
     return str(round(total_km * 0.621371, 2))
-
-
-async def get_monthly_mileage(device_id: str) -> str | None:
-    """Fetch mileage for the current month for a device from PlanetGPS."""
+async def get_monthly_mileage(device_id: str, since: str | None = None) -> str | None:
+    """Fetch mileage for the current month for a device from PlanetGPS.
+    Если задан `since` (YYYY-MM-DD) и он позже начала текущего месяца — считаем
+    пробег с этой даты, а не с 1-го числа (обнуление при смене водителя посреди
+    месяца: новый водитель не наследует пробег предыдущего). Со следующего
+    месяца since автоматически оказывается раньше начала месяца → счёт снова
+    с 1-го.
+    """
     now = datetime.now(timezone.utc)
-    start = f"{now.year}-{now.month:02d}-01 00:00"
+    month_start = datetime(now.year, now.month, 1)
+    start_dt = month_start
+    if since:
+        try:
+            s = datetime.strptime(str(since)[:10], "%Y-%m-%d")
+            if s > month_start:
+                start_dt = s
+        except Exception:
+            pass
+    start = start_dt.strftime("%Y-%m-%d 00:00")
     end = f"{now.year}-{now.month:02d}-{now.day:02d} 23:59"
     return await get_period_mileage(device_id, start, end)
-
-
 async def _match_row_by_device_name(rows: list, device_id: str):
     """Report rows may lack device ids; match through the fleet list by name."""
     try:
@@ -435,30 +393,24 @@ async def _match_row_by_device_name(rows: list, device_id: str):
     except Exception as e:
         print(f"Fleet lookup error: {e}")
         return None
-
 # ================== ROUTES ==================
-
 async def handle_me(request: web.Request):
     init_data = request.headers.get("X-Telegram-Init-Data", "")
     user = verify_telegram_init_data(init_data) if init_data else None
     if not user:
         return web.json_response({"error": "Unauthorized"}, status=401)
-
     uid = user.get("id")
     # Имя берём из drivers.json (настоящее ФИО), а не из Telegram-профиля,
     # который может быть пустым/псевдонимом. На Telegram-имя откатываемся,
     # только если водителя нет в базе.
     driver = load_drivers().get(str(uid), {})
     name = (driver.get("name") or "").strip() or user.get("first_name", "")
-
     return web.json_response({
         "id": uid,
         "name": name,
         "is_admin": uid in ALLOWED_ADMINS,
         "is_driver": bool(driver),
     })
-
-
 async def handle_drivers(request: web.Request):
     if not is_admin_request(request):
         return web.json_response({"error": "Forbidden"}, status=403)
@@ -481,11 +433,8 @@ async def handle_drivers(request: web.Request):
             "file_count": len(files),
         })
     return web.json_response(result)
-
-
 async def handle_driver_get(request: web.Request):
     """Admin view of one driver: profile + documents + this month's mileage.
-
     Returns the same shape the driver sees in their own profile (driver +
     files + mileage), so the admin panel can render the driver's profile
     'as the driver sees it' while staying authenticated as the admin.
@@ -499,14 +448,12 @@ async def handle_driver_get(request: web.Request):
     driver = drivers[driver_id]
     folder = get_driver_folder(driver_id, driver.get("name", ""))
     files = await asyncio.to_thread(list_driver_files, folder)
-
     # Live mileage for the current month (same source the driver self-view uses)
     device_id = driver.get("planet_gps_device_id", "")
     # Месячный пробег подтягивается на клиенте с fleet-бэкенда (там рабочий GPS),
     # поэтому здесь не блокируемся на медленном/ненадёжном скрейпинге.
     mileage_value = None
     now = datetime.now(timezone.utc)
-
     return web.json_response({
         "driver": {
             "id": driver_id,
@@ -532,8 +479,6 @@ async def handle_driver_get(request: web.Request):
             "has_gps": bool(device_id),
         },
     })
-
-
 async def handle_driver_add(request: web.Request):
     if not is_admin_request(request):
         return web.json_response({"error": "Forbidden"}, status=403)
@@ -565,8 +510,6 @@ async def handle_driver_add(request: web.Request):
         return web.json_response({"success": True, "id": driver_id})
     except Exception as e:
         return web.json_response({"error": str(e)}, status=500)
-
-
 async def handle_driver_update(request: web.Request):
     """Update driver fields (admin only). Used to set planet_gps_device_id and
     the custom monthly mileage limit on existing drivers."""
@@ -586,16 +529,12 @@ async def handle_driver_update(request: web.Request):
         return web.json_response({"success": True})
     except Exception as e:
         return web.json_response({"error": str(e)}, status=500)
-
-
 def _delete_driver_assets(folder: str):
     cloudinary.api.delete_resources_by_prefix(folder + "/")
     try:
         cloudinary.api.delete_folder(folder)
     except Exception:
         pass
-
-
 async def handle_driver_delete(request: web.Request):
     if not is_admin_request(request):
         return web.json_response({"error": "Forbidden"}, status=403)
@@ -612,8 +551,6 @@ async def handle_driver_delete(request: web.Request):
     del drivers[driver_id]
     save_drivers(drivers)
     return web.json_response({"success": True})
-
-
 async def handle_upload(request: web.Request):
     if not is_admin_request(request):
         return web.json_response({"error": "Forbidden"}, status=403)
@@ -641,8 +578,6 @@ async def handle_upload(request: web.Request):
         return web.json_response({"success": True, "name": filename, "url": result["secure_url"], "public_id": result["public_id"]})
     except Exception as e:
         return web.json_response({"error": str(e)}, status=500)
-
-
 async def handle_file_delete(request: web.Request):
     if not is_admin_request(request):
         return web.json_response({"error": "Forbidden"}, status=403)
@@ -655,10 +590,7 @@ async def handle_file_delete(request: web.Request):
         return web.json_response({"success": True})
     except Exception as e:
         return web.json_response({"error": str(e)}, status=500)
-
-
 # ================== DRIVER SELF-VIEW ==================
-
 async def handle_driver_me(request: web.Request):
     """
     Driver-facing endpoint. Returns own profile + documents + monthly mileage.
@@ -667,24 +599,18 @@ async def handle_driver_me(request: web.Request):
     user = get_user_from_request(request)
     if not user:
         return web.json_response({"error": "Unauthorized"}, status=401)
-
     user_id = str(user.get("id", ""))
     drivers = load_drivers()
-
     if user_id not in drivers:
         return web.json_response({"error": "Not registered"}, status=403)
-
     driver = drivers[user_id]
     folder = get_driver_folder(user_id, driver.get("name", ""))
     files = await asyncio.to_thread(list_driver_files, folder)
-
     # Месячный пробег подтягивается на клиенте с fleet-бэкенда (рабочий GPS).
     mileage = None
     device_id = driver.get("planet_gps_device_id", "")
-
     now = datetime.now(timezone.utc)
     month_label = now.strftime("%B %Y")
-
     return web.json_response({
         "driver": {
             "id": user_id,
@@ -709,11 +635,8 @@ async def handle_driver_me(request: web.Request):
             "has_gps": bool(device_id),
         }
     })
-
-
 async def handle_driver_me_upload(request: web.Request):
     """Driver uploads a document into their OWN Cloudinary folder.
-
     Auth: any valid Telegram user whose ID exists in drivers.json (same as
     /driver/me). This is the self-service counterpart to the admin-only
     /driver/{id}/upload — a driver may add files to their own folder but to
@@ -750,26 +673,21 @@ async def handle_driver_me_upload(request: web.Request):
         })
     except Exception as e:
         return web.json_response({"error": str(e)}, status=500)
-
-
 # ================== MILEAGE ENDPOINTS ==================
-
 async def handle_mileage(request: web.Request):
-    """GET /api/mileage/{device_id} — monthly mileage for a specific device.
-
+    """GET /api/mileage/{device_id}?since=YYYY-MM-DD — monthly mileage for a device.
+    Если задан ?since (дата пересадки водителя) и она в текущем месяце — пробег
+    считается с этой даты, иначе с 1-го числа месяца.
     Intentionally unauthenticated to preserve the original public contract.
-    (To lock it down, add: `if not get_user_from_request(request): return 401`.)
     """
     device_id = request.match_info["device_id"]
     if not device_id:
         return web.json_response({"mileage": None})
-    mileage = await get_monthly_mileage(device_id)
+    since = request.rel_url.query.get("since")
+    mileage = await get_monthly_mileage(device_id, since)
     return web.json_response({"mileage": mileage})
-
-
 async def handle_service_mileage(request: web.Request):
     """GET /api/service-mileage/{device_id}?since=YYYY-MM-DD
-
     Mileage (in miles) driven from the last service date up to now. Used by the
     driver cabinet to compute "miles until next service" = 7000 − this value.
     Returns {"mileage": <str|None>, "since": <start>}.
@@ -786,10 +704,7 @@ async def handle_service_mileage(request: web.Request):
     end = datetime.now(timezone.utc).strftime("%Y-%m-%d 23:59")
     mileage = await get_period_mileage(device_id, start, end)
     return web.json_response({"mileage": mileage, "since": start})
-
-
 # ================== FLEET ==================
-
 async def handle_fleet(request: web.Request):
     if not is_admin_request(request):
         return web.json_response({"error": "Forbidden"}, status=403)
@@ -799,18 +714,14 @@ async def handle_fleet(request: web.Request):
     if not data or not data.get("d"):
         return web.json_response({"error": "PlanetGPS unavailable"}, status=502)
     return web.json_response(data)
-
-
 async def handle_fleet_report(request: web.Request):
     if not is_admin_request(request):
         return web.json_response({"error": "Forbidden"}, status=403)
-
     params = request.rel_url.query
     start = params.get("from", "")
     end = params.get("to", "")
     if not start or not end:
         return web.json_response({"error": "Missing from/to"}, status=400)
-
     payload = json.dumps({
         "UserID": PLANET_GPS_USER_ID,
         "TimeZones": "5:00",
@@ -824,8 +735,6 @@ async def handle_fleet_report(request: web.Request):
     if not data:
         return web.json_response({"error": "PlanetGPS unavailable"}, status=502)
     return web.json_response(data)
-
-
 async def _fetch_report_page(report_url: str, headers: dict) -> str | None:
     """GET the report page HTML, re-logging in once if the session is dead."""
     for attempt in range(2):
@@ -843,11 +752,8 @@ async def _fetch_report_page(report_url: str, headers: dict) -> str | None:
             print(f"Report page fetch error (attempt {attempt + 1}): {e}")
         await _invalidate_gps_session(sess)
     return None
-
-
 def _convert_report_to_miles(content: bytes, start: str, end: str) -> tuple[bytes, str, str]:
     """Convert the km mileage column of the exported report to miles.
-
     openpyxl is imported lazily so a missing optional dependency can only
     degrade this one feature (the report is returned unconverted) instead of
     crashing the whole bot+API at startup.
@@ -867,7 +773,6 @@ def _convert_report_to_miles(content: bytes, start: str, end: str) -> tuple[byte
                             header_row = cell.row
                 if header_row:
                     break
-
             if mileage_col and header_row:
                 for row in ws.iter_rows(min_row=header_row + 1):
                     for cell in row:
@@ -879,7 +784,6 @@ def _convert_report_to_miles(content: bytes, start: str, end: str) -> tuple[byte
                 header_cell = ws.cell(row=header_row, column=mileage_col)
                 if header_cell.value:
                     header_cell.value = "Mileage (mi)"
-
         out = io.BytesIO()
         wb.save(out)
         return (
@@ -894,18 +798,14 @@ def _convert_report_to_miles(content: bytes, start: str, end: str) -> tuple[byte
             f"report_{start[:10]}_{end[:10]}.xls",
             "application/vnd.ms-excel",
         )
-
-
 async def handle_fleet_report_excel(request: web.Request):
     if not is_admin_request(request):
         return web.json_response({"error": "Forbidden"}, status=403)
-
     params = request.rel_url.query
     start = params.get("from", "")
     end = params.get("to", "")
     if not start or not end:
         return web.json_response({"error": "Missing from/to"}, status=400)
-
     report_url = f"{PLANET_GPS_BASE}/Report/Report.aspx?id={PLANET_GPS_USER_ID}&deviceid=0&randon=12345"
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
@@ -917,12 +817,10 @@ async def handle_fleet_report_excel(request: web.Request):
     sess = _gps_session
     if sess is None or sess.closed:
         return web.json_response({"error": "PlanetGPS unavailable"}, status=502)
-
     fields = {}
     for field in ["__VIEWSTATE", "__VIEWSTATEGENERATOR", "__EVENTVALIDATION"]:
         m = re.search(rf'id="{field}"[^>]*value="([^"]*)"', html)
         fields[field] = m.group(1) if m else ""
-
     data = {
         **fields,
         "beginTime": start,
@@ -936,12 +834,10 @@ async def handle_fleet_report_excel(request: web.Request):
         **headers,
         "Content-Type": "application/x-www-form-urlencoded",
     }
-
     try:
         async with sess.post(report_url, data=data, headers=post_headers,
                              timeout=GPS_REPORT_TIMEOUT) as resp:
             content = await resp.read()
-
         content, filename, content_type = await asyncio.to_thread(
             _convert_report_to_miles, content, start, end
         )
@@ -952,8 +848,6 @@ async def handle_fleet_report_excel(request: web.Request):
         )
     except Exception as e:
         return web.json_response({"error": str(e)}, status=500)
-
-
 # ================== CORS MIDDLEWARE ==================
 @web.middleware
 async def cors_middleware(request, handler):
@@ -968,8 +862,6 @@ async def cors_middleware(request, handler):
     response.headers["Access-Control-Allow-Headers"] = "Content-Type, X-Telegram-Init-Data"
     response.headers["Access-Control-Allow-Methods"] = "GET, POST, PATCH, DELETE, OPTIONS"
     return response
-
-
 def create_app() -> web.Application:
     app = web.Application(middlewares=[cors_middleware])
     app.router.add_get("/me", handle_me)
@@ -997,8 +889,6 @@ def create_app() -> web.Application:
     for path in options_paths:
         app.router.add_options(path, lambda r: web.Response())
     return app
-
-
 async def _gps_ping() -> bool:
     """Cheap HTTP request that both checks and extends the server-side session."""
     sess = _gps_session
@@ -1013,8 +903,6 @@ async def _gps_ping() -> bool:
     except Exception as e:
         print(f"GPS ping error: {e}")
         return False
-
-
 async def keep_gps_session_alive():
     """Keep the PlanetGPS session warm with cheap HTTP pings; only do a full
     browser login when the session is actually gone. (The old version
@@ -1040,8 +928,6 @@ async def keep_gps_session_alive():
         except Exception as e:
             print(f"GPS keepalive error: {e}")
         await asyncio.sleep(GPS_PING_INTERVAL)
-
-
 async def start_server():
     app = create_app()
     runner = web.AppRunner(app)
@@ -1057,6 +943,5 @@ async def start_server():
         keepalive.cancel()
         await _close_gps_session()
         await runner.cleanup()
-
 if __name__ == "__main__":
     asyncio.run(start_server())
